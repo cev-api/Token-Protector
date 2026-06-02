@@ -1,0 +1,15 @@
+/.gradle/
+/build/
+/out/
+/run/
+
+*.log
+*.tmp
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+.idea/
+.vscode/
+*.iml

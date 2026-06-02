@@ -1,0 +1,16 @@
+{
+    "required": true,
+    "package": "net.tokenprotector.mixin",
+    "compatibilityLevel": "JAVA_25",
+    "mixins": [],
+    "client": [
+        "AuthlibMinecraftClientMixin",
+        "MainMixin",
+        "MinecraftMixin",
+        "ScreenMixin",
+        "UserMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}

@@ -1,0 +1,38 @@
+{
+    "schemaVersion": 1,
+    "id": "tokenprotector",
+    "version": "${version}",
+    "name": "TokenProtector",
+    "description": "TokenProtector prevents malicious mods from stealing your Minecraft session token. It sits between the game's authentication system and every mod in your instance, serving fake token data to unauthorized callers while keeping multiplayer, skins, and Realms fully functional.",
+    "authors": [
+        "CevAPI"
+    ],
+    "contact": {
+        "homepage": "https://github.com/cev-api",
+        "sources": "https://github.com/cev-api/Token-Protector",
+        "issues": "https://github.com/cev-api/Token-Protector/issues"
+    },
+    "license": "MIT",
+    "icon": "TP.png",
+    "environment": "client",
+    "entrypoints": {
+        "client": [
+            "net.tokenprotector.TokenProtectorMod"
+        ],
+        "modmenu": [
+            "net.tokenprotector.config.ModMenuIntegration"
+        ]
+    },
+    "mixins": [
+        "tokenprotector.mixins.json"
+    ],
+    "depends": {
+        "fabricloader": ">=${loader_version}",
+        "minecraft": "${minecraft_version}",
+        "java": ">=25",
+        "fabric-api": "*"
+    },
+    "suggests": {
+        "modmenu": "*"
+    }
+}
