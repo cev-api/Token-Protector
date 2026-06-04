@@ -1,61 +1,284 @@
-plugins {
-    id 'net.fabricmc.fabric-loom' version "${loom_version}"
-    id 'maven-publish'
-}
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.TaskAction
+import org.gradle.internal.jvm.Jvm
+import org.gradle.process.ExecOperations
+
+import javax.inject.Inject
 
 version = project.mod_version
 group = project.maven_group
+
+def customBuildDir = findProperty('tokenprotector_build_dir')
+def singleBuild = providers.gradleProperty('tokenprotector_single_build').map { it.toBoolean() }.orElse(false).get()
+def loomPluginId = findProperty('loom_plugin_id')
+def noRemapBuild = loomPluginId == 'net.fabricmc.fabric-loom'
+def mappingsMode = findProperty('mappings_mode') ?: 'yarn'
+
+if (customBuildDir) {
+    layout.buildDirectory.set(file(customBuildDir))
+}
+
+buildscript {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+
+    if (providers.gradleProperty('tokenprotector_single_build').map { it.toBoolean() }.orElse(false).get()) {
+        dependencies {
+            classpath "net.fabricmc:fabric-loom:${loom_version}"
+        }
+    }
+}
+
+if (singleBuild) {
+    if (!loomPluginId) {
+        throw new GradleException("Missing required property 'loom_plugin_id' for single-version builds.")
+    }
+
+    apply plugin: loomPluginId
+    apply plugin: 'maven-publish'
+}
+
+apply plugin: 'base'
 
 base {
     archivesName = project.archives_base_name
 }
 
-repositories {
-    mavenCentral()
-    maven {
-        name = 'Fabric'
-        url = 'https://maven.fabricmc.net/'
+if (singleBuild) {
+    repositories {
+        mavenCentral()
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        maven {
+            name = 'TerraformersMC'
+            url = 'https://maven.terraformersmc.com/releases/'
+        }
     }
-    maven {
-        name = 'TerraformersMC'
-        url = 'https://maven.terraformersmc.com/releases/'
+
+    dependencies {
+        minecraft "com.mojang:minecraft:${project.minecraft_version}"
+
+        if (mappingsMode == 'official') {
+            mappings loom.officialMojangMappings()
+        } else if (project.hasProperty('mappings_version')) {
+            mappings "net.fabricmc:yarn:${project.mappings_version}:v2"
+        }
+
+        if (noRemapBuild) {
+            implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+            implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+            compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+        } else {
+            modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+            modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+            modCompileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+        }
+    }
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(project.java_version as int)
+        }
+        withSourcesJar()
+    }
+
+    sourceSets {
+        main {
+            java {
+                def mcVer = project.minecraft_version
+
+                if (mcVer.startsWith("1.21")) {
+                    srcDir 'src/version-1.21/java'
+                } else if (mcVer.startsWith("26.")) {
+                    srcDir 'src/version-26.1/java'
+                } else {
+                    throw new GradleException("Unsupported minecraft_version: ${mcVer}. Expected 1.21.x or 26.x")
+                }
+            }
+        }
+    }
+
+    def javaRelease = project.java_version as int
+
+    tasks.withType(JavaCompile).configureEach {
+        options.release = javaRelease
+    }
+
+    def mcRange = project.minecraft_version.startsWith("1.21") \
+        ? ">=1.21.1 <1.22" \
+        : ">=26.1.0 <27"
+
+    processResources {
+        inputs.property 'version', project.version
+        inputs.property 'minecraft_range', mcRange
+        inputs.property 'loader_version', project.loader_version
+        inputs.property 'java_version', project.java_version
+
+        filesMatching('fabric.mod.json') {
+            expand(
+                'version': project.version,
+                'minecraft_range': mcRange,
+                'loader_version': project.loader_version,
+                'java_version': project.java_version
+            )
+        }
+
+        filesMatching('tokenprotector.mixins.json') {
+            expand(
+                'java_version': project.java_version
+            )
+        }
+    }
+
+    jar {
+        from('LICENSE') {
+            rename { "${it}_${project.archives_base_name}" }
+        }
+    }
+
+}
+
+def multiVersionBuilds = [
+    [
+        loomPluginId    : 'fabric-loom',
+        loomVersion     : '1.15.5',
+        minecraftVersion: '1.21.11',
+        mappingsMode    : 'official',
+        fabricVersion   : '0.141.4+1.21.11',
+        loaderVersion   : '0.18.4',
+        modmenuVersion  : '11.0.3',
+        javaVersion     : '21'
+    ],
+    [
+        loomPluginId    : 'net.fabricmc.fabric-loom',
+        loomVersion     : '1.16.3',
+        minecraftVersion: '26.1.2',
+        fabricVersion   : '0.149.1+26.1.2',
+        loaderVersion   : '0.19.2',
+        modmenuVersion  : '18.0.0-beta.1',
+        javaVersion     : '25'
+    ]
+]
+
+def rootLibsDir = layout.buildDirectory.dir('libs')
+
+abstract class BuildBothTask extends DefaultTask {
+    @Inject
+    abstract ExecOperations getExecOperations()
+
+    @Input
+    List<Map<String, String>> buildConfigs
+
+    @InputFile
+    File wrapperJar
+
+    @Internal
+    File rootProjectDir
+
+    @OutputDirectory
+    File outputLibsDir
+
+    @Input
+    String archiveBaseName
+
+    @Input
+    String artifactVersion
+
+    @TaskAction
+    void buildAll() {
+        project.delete(outputLibsDir)
+
+        if (!wrapperJar.exists()) {
+            throw new GradleException("Missing Gradle wrapper JAR: ${wrapperJar}")
+        }
+
+        buildConfigs.each { buildConfig ->
+            def versionBuildDir = new File(outputLibsDir.parentFile, "version-builds/mc${buildConfig.minecraftVersion}")
+
+            logger.lifecycle("Building Minecraft ${buildConfig.minecraftVersion} into ${versionBuildDir}")
+
+            execOperations.exec {
+                workingDir = rootProjectDir
+                executable = Jvm.current().javaExecutable.absolutePath
+                def childArgs = [
+                    '-Dorg.gradle.appname=gradlew',
+                    '-classpath',
+                    wrapperJar.absolutePath,
+                    'org.gradle.wrapper.GradleWrapperMain',
+                    '--no-daemon',
+                    'clean',
+                    'build',
+                    '-Ptokenprotector_single_build=true',
+                    "-Ptokenprotector_build_dir=${versionBuildDir.absolutePath}",
+                    "-Ploom_plugin_id=${buildConfig.loomPluginId}",
+                    "-Ploom_version=${buildConfig.loomVersion}",
+                    "-Pminecraft_version=${buildConfig.minecraftVersion}",
+                    buildConfig.containsKey('mappingsMode') ? "-Pmappings_mode=${buildConfig.mappingsMode}" : null,
+                    buildConfig.containsKey('mappingsVersion') ? "-Pmappings_version=${buildConfig.mappingsVersion}" : null,
+                    "-Pfabric_version=${buildConfig.fabricVersion}",
+                    "-Ploader_version=${buildConfig.loaderVersion}",
+                    "-Pmodmenu_version=${buildConfig.modmenuVersion}",
+                    "-Pjava_version=${buildConfig.javaVersion}"
+                ].findAll { it != null }
+                args(childArgs)
+            }
+
+            def sourceJar = new File(versionBuildDir, "libs/${archiveBaseName}-${artifactVersion}.jar")
+            def targetJar = new File(outputLibsDir, "${archiveBaseName}-${artifactVersion}-mc${buildConfig.minecraftVersion}.jar")
+
+            if (!sourceJar.exists()) {
+                throw new GradleException("Expected build output not found: ${sourceJar}")
+            }
+
+            project.copy {
+                from sourceJar
+                into targetJar.parentFile
+                rename { targetJar.name }
+            }
+        }
     }
 }
 
-dependencies {
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-    compileOnly "com.terraformersmc:modmenu:18.0.0-beta.1"
+tasks.register('buildBoth', BuildBothTask) {
+    group = 'build'
+    description = 'Builds TokenProtector for Minecraft 1.21.11 and 26.1.2 without using cmd.exe.'
+    buildConfigs = multiVersionBuilds
+    wrapperJar = file('gradle/wrapper/gradle-wrapper.jar')
+    rootProjectDir = rootDir
+    outputLibsDir = rootLibsDir.get().asFile
+    archiveBaseName = project.archives_base_name
+    artifactVersion = project.version.toString()
+
+    outputs.files(multiVersionBuilds.collect { buildConfig ->
+        rootLibsDir.map {
+            it.file("${project.archives_base_name}-${project.version}-mc${buildConfig.minecraftVersion}.jar")
+        }
+    })
 }
 
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
-    }
-    withSourcesJar()
-}
-
-tasks.withType(JavaCompile).configureEach {
-    options.release = 25
-}
-
-processResources {
-    inputs.property 'version', project.version
-    inputs.property 'minecraft_version', project.minecraft_version
-    inputs.property 'loader_version', project.loader_version
-
-    filesMatching('fabric.mod.json') {
-        expand(
-            'version': project.version,
-            'minecraft_version': project.minecraft_version,
-            'loader_version': project.loader_version
-        )
+if (!singleBuild) {
+    tasks.named('build') {
+        dependsOn(tasks.named('buildBoth'))
+        setDependsOn([tasks.named('buildBoth')])
+        description = 'Builds both TokenProtector jars for Minecraft 1.21.x and 26.1.x.'
     }
 }
 
-jar {
-    from('LICENSE') {
-        rename { "${it}_${project.archives_base_name}" }
-    }
-}
+// ── Build ──────────────────────────────────────────────────────
+//   ./gradlew build          → builds BOTH 1.21.11 + 26.1.2
+//   ./gradlew buildBoth      → builds BOTH 1.21.11 + 26.1.2
+//
+// For an internal or explicit single-version build:
+//   ./gradlew build -Ptokenprotector_single_build=true -Ploom_plugin_id=fabric-loom -Ploom_version=1.15.5 -Pminecraft_version=1.21.11 -Pmappings_mode=official -Pfabric_version=0.141.4+1.21.11 -Ploader_version=0.18.4 -Pmodmenu_version=11.0.3 -Pjava_version=21
+//   ./gradlew build -Ptokenprotector_single_build=true -Ploom_plugin_id=net.fabricmc.fabric-loom -Ploom_version=1.16.3 -Pminecraft_version=26.1.2 -Pfabric_version=0.149.1+26.1.2 -Ploader_version=0.19.2 -Pmodmenu_version=18.0.0-beta.1 -Pjava_version=25

@@ -167,7 +167,7 @@ public final class AlertManager {
         }
         if (client.player != null) {
             try {
-                client.player.sendSystemMessage(
+                sendPlayerMessage(
                         Component.literal("§e[TokenProtector] §6⚠ Detected §etoken exposed at OS level (§4"
                                 + leakSource + "§e). §7Your launcher is leaking your token.")
                 );
@@ -194,11 +194,33 @@ public final class AlertManager {
     private static void sendChatMessage(Minecraft client, String modName, String field) {
         if (client.player == null) return;
         try {
-            client.player.sendSystemMessage(
+            sendPlayerMessage(
                     Component.literal("§c[TokenProtector] §4⚠ Protected §cfield access by §6"
                             + modName + " §7(" + field + ")")
             );
         } catch (Exception ignored) {}
+    }
+
+    private static void sendPlayerMessage(Component message) throws ReflectiveOperationException {
+        Minecraft client = Minecraft.getInstance();
+        if (client == null || client.player == null) return;
+
+        Object player = client.player;
+
+        try {
+            player.getClass().getMethod("sendSystemMessage", Component.class).invoke(player, message);
+            return;
+        } catch (NoSuchMethodException ignored) {
+            // 1.21.11 uses a different chat helper on LocalPlayer.
+        }
+
+        try {
+            player.getClass().getMethod("displayClientMessage", Component.class, boolean.class)
+                    .invoke(player, message, false);
+        } catch (NoSuchMethodException ignored) {
+            player.getClass().getMethod("sendMessage", Component.class, boolean.class)
+                    .invoke(player, message, false);
+        }
     }
 
     private static String configField(String field) {

@@ -1,7 +1,7 @@
 # TokenProtector
 ![TokenProtector icon](src/main/resources/TP.png)
 
-### Real-time session token protection for Minecraft 26.1.2 Fabric
+### Real-time session token protection for Minecraft 1.21.x / 26.1.x Fabric
 
 ## What it does
 
@@ -73,7 +73,7 @@ Nested JARs (e.g. `com_github_...`, `org_jetbrains_...`) are automatically filte
 
 1. Download `tokenprotector-1.0.0.jar` from [Releases](../../releases)
 2. Place in `mods/` folder
-3. Requires **Minecraft 26.1.2**, **Fabric Loader 0.19.2+**, **Fabric API**, **Java 25**
+3. Requires **Minecraft 1.21.x** (Java 21) or **26.1.x** (Java 25), **Fabric Loader 0.16.10+**, **Fabric API**
 4. Mod Menu is optional but recommended for the settings screen
 
 ## Testing
@@ -97,12 +97,32 @@ While still being able to join multiplayer servers - the real token reaches Moja
 
 ## Building from source
 
+### Build both versions at once (recommended)
+
 ```powershell
 $env:JAVA_HOME = 'C:\Program Files\Eclipse Adoptium\jdk-25.0.2.10-hotspot'
 ./gradlew build --no-daemon
 ```
 
-Requires JDK 25 and Gradle 9.1.0+. Output at `build/libs/tokenprotector-1.0.0.jar`.
+Produces:
+- `build/libs/tokenprotector-1.0.0-mc1.21.11.jar`
+- `build/libs/tokenprotector-1.0.0-mc26.1.2.jar`
+
+No editing of `gradle.properties` needed. `build` delegates to the internal multi-version build and compiles both jars in sequence.
+
+### Build a single version
+
+Edit `gradle.properties` and set the version you want, then `./gradlew build`. Even easier: use `-P` flags without editing any files:
+
+```powershell
+# For 1.21.x:
+./gradlew build --no-daemon -Ptokenprotector_single_build=true -Ploom_plugin_id=fabric-loom -Ploom_version=1.15.5 -Pminecraft_version=1.21.11 -Pmappings_mode=official -Pfabric_version=0.141.4+1.21.11 -Ploader_version=0.18.4 -Pmodmenu_version=11.0.3 -Pjava_version=21
+
+# For 26.1.x:
+./gradlew build --no-daemon -Ptokenprotector_single_build=true -Ploom_plugin_id=net.fabricmc.fabric-loom -Ploom_version=1.16.3 -Pminecraft_version=26.1.2 -Pfabric_version=0.149.1+26.1.2 -Ploader_version=0.19.2 -Pmodmenu_version=18.0.0-beta.1 -Pjava_version=25
+```
+
+The 1.21 source set is compatible with **all** 1.21.x versions (the `User` API is stable across the entire 1.21 line). The `fabric.mod.json` uses a version range (`>=1.21.1 <1.22` or `>=26.1.0 <27`) so the JAR loads on any matching Minecraft version.
 
 
 ## FAQ
