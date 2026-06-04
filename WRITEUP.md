@@ -66,6 +66,7 @@ The result is a protection model where every mod-visible path returns fake data,
 My Token Protector shows that a Fabric mod can successfully block these token reads:
 
 - `User.getAccessToken()` and all normal public accessors.
+- `User.getSessionId()` — blocked through the same call-stack check as `getAccessToken()`.
 - Java reflection on `User` field values.
 - `Unsafe.getObject(...)` reads on the same fields.
 - `VarHandle` and `MethodHandle` access paths.
@@ -93,13 +94,13 @@ The system also tracks suspicious behavior:
 
 This is critical because the remaining risk is not a normal getter but a timing/side-channel attack.
 
-### The spin-race exception
+### The authlib deep-hook and spin-race edge case
 
-The one probe that still challenges the system is the concurrent spin-race.
-This probe polls `MinecraftClient.accessToken` at maximum speed during server connection and auth handshake, trying to catch the tiny moment when authlib restores the real token for an HTTP request.
+Two boundary-pushing probes still test the edges of the protection model.
 
-Token Protector does not fail quietly here; it detects the behavior and logs it as suspicious.
-That means the protection is still effective in practice, because the only remaining risk is an active, noisy timing attack that is detectable.
+**The authlib deep hook** (`postInternal` → `setRequestProperty`) was the attack vector raised by the Ratter Scanner community. The concern was that hooking deeper than `User` - into the HTTP layer where authlib actually sends the token - would bypass the protector. Testing proved this is blocked: `MinecraftClient.accessToken` is fake at rest, so the `Authorization: Bearer` header sent to Mojang contains `FAKE_TOKEN_LOL`.
+
+**The spin-race** polls `MinecraftClient.accessToken` at maximum speed during server joins, trying to catch the ~7ms window when TokenProtector restores the real token for an HTTP request. This is the only probe that can still capture the real JWT. TokenProtector does not fail quietly - it detects the behavior, flags it as a `🔴 SPIN-RACE DETECTED` alert, and the attempt is logged. This is a noisy, CPU-spiking attack that no known stealer mod uses.
 
 ---
 
@@ -203,6 +204,18 @@ The token reader also hooks key lifecycle moments:
 
 These are the moments a stealer is most likely to read a token.
 
+### 8.5. Authlib HTTP-layer deep hooks
+
+The reviewer from the Ratter Scanner Discord specifically asked about hooking `HttpURLConnection.setRequestProperty`. Since JDK classes cannot be targeted by Mixin (they load pre-Mixin), the practical stealer approach is to hook authlib instead.
+
+These probes intercept every HTTP entry point on `MinecraftClient`:
+
+- `postInternal` - the exact method the reviewer described, where `connection.setRequestProperty("Authorization", "Bearer " + this.accessToken)` is called
+- `get` and both `post` overloads - the public methods that all route through `postInternal`
+- `createUrlConnection` - the connection factory called before auth headers are set
+
+All showed `FAKE_TOKEN_LOL` during live testing, confirming the Bearer header never contains the real JWT.
+
 ### 9. Concurrent time-window attack
 
 The final probe is a spin-race.
@@ -273,6 +286,65 @@ That is why obfuscation is cheap:
 The actual secret access still follows the same path.
 
 So the defender must protect the data, not just block specific names.
+
+---
+
+## The "hook deeper than the protector" challenge
+
+During a review in the Ratter Scanner Discord, a valid concern was raised:
+
+> "What prevents an attacker from hooking simply deeper than TokenProtector currently does? In the latest version of Minecraft (26.1.2), `postInternal` calls `HttpURLConnection.setRequestProperty` to add the accessToken in the Authorization header. That means an attacker could hook `setRequestProperty` instead to grab the token."
+
+This is a legitimate question. If the protector only guards `User`/`Session`-level access, a stealer that mixes into authlib's HTTP layer would bypass it entirely. The reviewer was specifically describing the `MinecraftClient.postInternal` → `connection.setRequestProperty("Authorization", "Bearer " + accessToken)` chain.
+
+### Testing the claim
+
+To test this, the TokenReader harness was extended with deep-hook probes on every authlib HTTP entry point:
+
+- `MinecraftClient.postInternal(URL, byte[])` - the private method that creates the `HttpURLConnection` and sets the `Authorization: Bearer` header
+- `MinecraftClient.get(URL, Class)` - all public GET requests
+- `MinecraftClient.post(URL, Class)` - public POSTs with no body  
+- `MinecraftClient.post(URL, Object, Class)` - public POSTs with body (including session join)
+- `MinecraftClient.createUrlConnection(URL)` - the method that creates the connection object before auth headers are set
+
+These hooks read `MinecraftClient.accessToken` at the exact moment the HTTP request is about to be sent, and capture the full call stack to prove the call originates from Mojang auth code.
+
+### Result: blocked
+
+Every deep-hook intercept showed `FAKE_TOKEN_LOL`. The TokenProtector's poisoning of `MinecraftClient.accessToken` at the field level propagates all the way through:
+
+```
+postInternal HEAD  → accessToken = FAKE_TOKEN_LOL
+post (joinServer)  → accessToken = FAKE_TOKEN_LOL
+get (blocklist)    → accessToken = FAKE_TOKEN_LOL
+get (certificates) → accessToken = FAKE_TOKEN_LOL
+```
+
+The `Authorization: Bearer <token>` header sent to Mojang's servers contains the fake token - not the real one.
+
+### Why not hook `HttpURLConnection.setRequestProperty` directly?
+
+The reviewer suggested hooking `HttpURLConnection.setRequestProperty` - the JDK class itself. This was attempted. It crashed:
+
+```
+MixinTargetAlreadyLoadedException: target java.net.URLConnection was loaded too early.
+```
+
+You cannot `@Mixin` JDK classes in a Fabric mod. They're loaded during JVM bootstrap, before the Mixin subsystem initializes. A real stealer has the same constraint - it *must* hook authlib classes instead of JDK classes.
+
+An alternative approach using `URL.setURLStreamHandlerFactory()` to wrap all HTTP connections was also tested. It crashed on Java 25 because `sun.net.www.protocol.http.Handler` is locked inside the `java.base` module and not exported to unnamed modules.
+
+The practical conclusion: a stealer's only viable deep-hook target is `MinecraftClient.postInternal` - and that path is already covered by TokenProtector's field-level poisoning.
+
+### The only remaining bypass
+
+The spin-race probe (polling `MinecraftClient.accessToken` at ~24M reads/sec) can catch the real JWT during the ~7ms window when TokenProtector temporarily swaps it for an actual HTTP call. This requires:
+
+- `sun.misc.Unsafe` access
+- Exact field offset discovery
+- A tight polling loop consuming significant CPU
+
+No known stealer mod uses this technique. It is noisy, detectable, and TokenProtector already flags rapid authlib polling as suspicious behavior.
 
 ---
 

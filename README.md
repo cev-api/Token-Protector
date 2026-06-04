@@ -19,11 +19,13 @@ For more information on how and why this program was written check out the [writ
 | Attack vector | Status | Returns |
 |---|---|---|
 | `User.getAccessToken()` | ❌ Blocked | Configurable fake |
+| `User.getSessionId()` | ❌ Blocked | Configurable fake |
 | `Field.get("accessToken")` | ❌ Blocked | Field itself is poisoned |
 | `Unsafe.getObject(offset)` | ❌ Blocked | Field is fake at rest |
 | `MethodHandle` / `LambdaMetaFactory` | ❌ Blocked | Same field, same poison |
 | Authlib `MinecraftClient.accessToken` (Unsafe) | ❌ Blocked | Time-window swap to fake |
 | Knot ClassLoader bypass | ❌ Blocked | Same call chain → same fake |
+| Hook `MinecraftClient.postInternal` / `setRequestProperty("Authorization", "Bearer " + token)` | ❌ Blocked | Field is fake at rest |
 | Legacy Yarn/MCP probes | ❌ Blocked | 26.1.2 is unmapped |
 | OS command-line snooping | ⚠️ Out of scope | Needs launcher fix |
 | `launcher_accounts.json` on disk | ⚠️ Out of scope | File-system level |
@@ -76,15 +78,18 @@ Nested JARs (e.g. `com_github_...`, `org_jetbrains_...`) are automatically filte
 
 ## Testing
 
-A comprehensive token-reader mod was used to verify the protection. Every probe technique returned fake data:
+A comprehensive token-reader mod was used to verify the protection. Every probe technique - including the `postInternal` → `setRequestProperty("Authorization", "Bearer " + token)` deep-hook attack suggested by the Ratter Scanner community - returned fake data:
 
 ```
 getAccessToken()        → FAKE_TOKEN      ← getter is blocked
+getSessionId()          → FAKE_TOKEN      ← getter is blocked
 accessToken (field)     → FAKE_TOKEN      ← field is poisoned at construction
 MinecraftClient.accessToken → FAKE_TOKEN  ← authlib field time-window blocked
 Unsafe.getObject()      → FAKE_TOKEN      ← field-level read is blocked
 MethodHandle / Lambda   → FAKE_TOKEN      ← all reflection paths blocked
 Legacy class_320/Session → CLASS NOT FOUND ← 26.1.2 unmapped, dead paths
+postInternal Bearer header → FAKE_TOKEN_LOL ← authlib HTTP layer is blocked
+get/post/createUrlConnection  → FAKE_TOKEN_LOL ← all authlib entry points blocked
 ```
 
 While still being able to join multiplayer servers - the real token reaches Mojang's authlib through a separate channel that mod code cannot reach.
@@ -105,6 +110,16 @@ Requires JDK 25 and Gradle 9.1.0+. Output at `build/libs/tokenprotector-1.0.0.ja
 ### Can't a mod just mix into authlib to get the token?
 
 No. The `User` object's `accessToken` **field itself** is overwritten with a fake value at construction - before any mod can read it. Mixing into authlib just means you arrive at the same poisoned field. The real token only lives in `TokenStash` (a package-private holder outside any game class) and `MinecraftClient.accessToken` (which is also faked at rest by `AuthlibMixin`).
+
+### What about hooking the HTTP request itself? Can a mod intercept `postInternal` and grab the token from `connection.setRequestProperty("Authorization", "Bearer " + token)`?
+
+This was the specific attack vector raised by a reviewer in the Ratter Scanner Discord: if TokenProtector only protects `User`/`Session`-level access, what stops an attacker from hooking deeper - into authlib's `postInternal` method where the `Authorization: Bearer <token>` header is set on the `HttpURLConnection`?
+
+This was tested with a dedicated deep-hook probe. The result: **blocked.** TokenProtector poisons `MinecraftClient.accessToken` at the field level, so when `postInternal` reads `this.accessToken` to build the `Bearer` header, it gets `FAKE_TOKEN_LOL` - just like every other read path. The fake token propagates all the way to the HTTP request.
+
+**How it was tested:** The TokenReader test harness was updated with `@Inject` hooks on all authlib HTTP entry points (`postInternal`, `post`, `get`, `createUrlConnection`). Every intercept showed `FAKE_TOKEN_LOL` during live server joins. The exact attack the reviewer described was reproduced and blocked.
+
+**Why not hook `HttpURLConnection.setRequestProperty` directly?** A real stealer can't `@Mixin` JDK classes - they're loaded during JVM bootstrap before Mixin initializes. Attempting it crashes with `MixinTargetAlreadyLoadedException`. The practical stealer approach is to hook `MinecraftClient.postInternal` (which is what the deep-hook probe does), and that path is already covered.
 
 ### What about FabricLoader? Doesn't it expose the session?
 
@@ -141,6 +156,8 @@ TokenProtector operates entirely within the JVM. It cannot protect against:
 ### The authlib time-window
 
 `MinecraftClient.accessToken` stores a fake value at rest and is swapped to the real token only during the ~1 ms of an actual HTTP call to Mojang's servers.  A mod with `sun.misc.Unsafe` access, the exact field offset discovered, and a tight spin-loop polling at microsecond intervals could theoretically catch the real value during that window.
+
+Note: The real token only appears during the swap window inside the `MinecraftClient.accessToken` field. The deep HTTP hooks on `postInternal` and `post`/`get` confirmed that by the time authlib actually makes its HTTP requests and sets the `Authorization: Bearer` header, the field has already been re-poisoned. The Bearer header sent to Mojang's servers contains `FAKE_TOKEN_LOL` - not the real token. 
 
 In practice this requires:
 
