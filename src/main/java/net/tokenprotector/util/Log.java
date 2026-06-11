@@ -10,7 +10,7 @@ public final class Log {
     public static void alert(String message, Object... args) {
         String rendered = MessageFormatter.arrayFormat(message, args).getMessage();
         SessionAccessMonitor.recordAlertLine(rendered);
-        TokenProtectorMod.LOGGER.error("[ALERT] " + message, args);
+        TokenProtectorMod.LOGGER.warn("[ALERT] " + message, args);
     }
 
     public static void info(String message, Object... args) {

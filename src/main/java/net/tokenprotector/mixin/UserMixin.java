@@ -36,23 +36,40 @@ public class UserMixin {
         User self = (User) (Object) this;
         TokenVault.store(self, name, profileId, accessToken, xuid, clientId);
 
+        // Sync TokenStash so authlib picks up the real token for this session.
+        // Only do this when the caller is trusted (Minecraft itself or a whitelisted mod).
+        // A non-whitelisted mod that creates a User must not be able to poison TokenStash.
+        SessionAccessMonitor.AccessInfo caller = SessionAccessMonitor.detectCaller();
+        if (!shouldProtect(caller, "accessToken")) {
+            net.tokenprotector.config.TokenStash.realAccessToken = accessToken;
+        }
+
+        int blockedCount = 0;
         if (Config.get().blockAccessToken) {
             this.accessToken = Config.get().getReplacement("accessToken", accessToken, TokenFaker.fakeAccessToken());
-            Log.info("[TokenProtector] Poisoned User.accessToken field at construction");
+            blockedCount++;
         }
         if (Config.get().blockProfileId) {
             this.uuid = profileReplacement(profileId);
+            blockedCount++;
         }
         if (Config.get().blockXuid) {
             String replacement = Config.get().getReplacement("xuid", xuid.orElse(""), TokenFaker.fakeXuid());
             this.xuid = Optional.ofNullable(replacement).filter(value -> !value.isBlank());
+            blockedCount++;
         }
         if (Config.get().blockClientId) {
             String replacement = Config.get().getReplacement("clientId", clientId.orElse(""), TokenFaker.fakeClientId());
             this.clientId = Optional.ofNullable(replacement).filter(value -> !value.isBlank());
+            blockedCount++;
         }
         if (Config.get().blockName) {
             this.name = Config.get().getReplacement("name", name, TokenFaker.fakeName());
+            blockedCount++;
+        }
+
+        if (blockedCount > 0) {
+            Log.info("[TokenProtector] Protected {} User field(s) at construction (real values stored, fakes served to unauthorized mods)", blockedCount);
         }
     }
 

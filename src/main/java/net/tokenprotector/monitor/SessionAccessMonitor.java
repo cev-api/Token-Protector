@@ -160,33 +160,55 @@ public final class SessionAccessMonitor {
     }
 
     private static ModIdentity identifyMod(String className) {
+        // Step 1: match by class resource URL against mod jar paths
         String resourceName = className.replace('.', '/') + ".class";
         URL resource = Thread.currentThread().getContextClassLoader().getResource(resourceName);
         String resourceUrl = resource != null ? resource.toString().replace('\\', '/').toLowerCase(Locale.ROOT) : "";
 
-        for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
-            try {
-                for (Path origin : container.getOrigin().getPaths()) {
-                    Path fileName = origin.getFileName();
-                    if (fileName != null && resourceUrl.contains(fileName.toString().toLowerCase(Locale.ROOT))) {
-                        return identity(container);
+        if (!resourceUrl.isEmpty()) {
+            for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
+                try {
+                    for (Path origin : container.getOrigin().getPaths()) {
+                        Path fileName = origin.getFileName();
+                        if (fileName != null && resourceUrl.contains(fileName.toString().toLowerCase(Locale.ROOT))) {
+                            return identity(container);
+                        }
                     }
+                } catch (UnsupportedOperationException ignored) {
+                    // Nested origins do not expose filesystem paths.
                 }
-            } catch (UnsupportedOperationException ignored) {
-                // Nested origins do not expose filesystem paths.
             }
         }
 
+        // Step 2: fallback - match by class package containing mod id
         String lowerClass = className.toLowerCase(Locale.ROOT);
+        // Try exact package-segment match first (e.g. net.wurstclient.xxx matches "wurstclient")
         for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
             String modId = container.getMetadata().getId();
             String normalizedId = modId.toLowerCase(Locale.ROOT).replace("-", "").replace("_", "");
+            if (normalizedId.isEmpty()) continue;
+
+            // Check if any package segment matches the mod id exactly
+            String[] parts = lowerClass.split("\\.");
+            for (String part : parts) {
+                if (part.equals(normalizedId)) {
+                    return identity(container);
+                }
+            }
+        }
+
+        // Step 3: looser fallback - substring match (with minimum length guard to avoid false positives)
+        for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
+            String modId = container.getMetadata().getId();
+            String normalizedId = modId.toLowerCase(Locale.ROOT).replace("-", "").replace("_", "");
+            if (normalizedId.length() < 3) continue;
             String normalizedClass = lowerClass.replace(".", "").replace("-", "").replace("_", "");
-            if (!normalizedId.isEmpty() && normalizedClass.contains(normalizedId)) {
+            if (normalizedClass.contains(normalizedId)) {
                 return identity(container);
             }
         }
 
+        Log.info("[TokenProtector] Could not identify mod for class: {}", className);
         return new ModIdentity("Unknown Mod", null);
     }
 

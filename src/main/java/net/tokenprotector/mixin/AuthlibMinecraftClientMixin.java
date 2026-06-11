@@ -41,7 +41,7 @@ public class AuthlibMinecraftClientMixin {
     private void onConstructed(CallbackInfo ci) {
         this.accessToken = fakeAuthToken();
         Log.info(
-                "[TokenProtector] Authlib MinecraftClient.accessToken poisoned (len={})",
+                "[TokenProtector] Authlib MinecraftClient.accessToken protected (len={}) - real token swapped during HTTP calls only",
                 this.accessToken != null ? this.accessToken.length() : 0);
     }
 

@@ -36,8 +36,11 @@ public final class AlertManager {
             return;
         }
 
+        // Spin-race alerts always fire regardless of whitelist
+        boolean isSpinRace = field != null && field.startsWith("SpinRace");
+
         // Keep this guard consistent if another call site triggers alerts directly.
-        if (info.modId() != null && Config.get().isFieldAllowed(info.modId(), configField(field))) {
+        if (!isSpinRace && info.modId() != null && Config.get().isFieldAllowed(info.modId(), configField(field))) {
             return;
         }
 
