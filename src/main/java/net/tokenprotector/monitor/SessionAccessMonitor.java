@@ -25,6 +25,7 @@ public final class SessionAccessMonitor {
     private static final Deque<AlertLine> RECENT_ALERTS = new ArrayDeque<>();
     private static final Map<String, Long> LAST_DETECTION_BY_KEY = new HashMap<>();
     private static final Set<String> SEEN_OS_LEAK_KEYS = new HashSet<>();
+    private static final Set<String> WARNED_UNKNOWN_CLASSES = new HashSet<>();
     private static int unreadAlerts;
 
     private SessionAccessMonitor() {}
@@ -155,7 +156,9 @@ public final class SessionAccessMonitor {
                 || className.startsWith("com.mojang.")
                 || className.startsWith("net.fabricmc.loader.")
                 || className.startsWith("net.fabricmc.api.")
+                || className.startsWith("net.fabricmc.fabric.")
                 || className.startsWith("org.prismlauncher.")
+                || className.startsWith("org.lwjgl.")
                 || className.startsWith("net.fabricmc.loader.impl.launch.");
     }
 
@@ -208,7 +211,11 @@ public final class SessionAccessMonitor {
             }
         }
 
-        Log.info("[TokenProtector] Could not identify mod for class: {}", className);
+        synchronized (WARNED_UNKNOWN_CLASSES) {
+            if (WARNED_UNKNOWN_CLASSES.add(className)) {
+                Log.info("[TokenProtector] Could not identify mod for class: {}", className);
+            }
+        }
         return new ModIdentity("Unknown Mod", null);
     }
 
