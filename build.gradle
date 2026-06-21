@@ -49,6 +49,10 @@ if (singleBuild) {
 
 apply plugin: 'base'
 
+tasks.named('clean') {
+    delete 'build-121', 'build-2612'
+}
+
 base {
     archivesName = project.archives_base_name
 }
@@ -101,6 +105,7 @@ if (singleBuild) {
                 if (mcVer.startsWith("1.21")) {
                     srcDir 'src/version-1.21/java'
                 } else if (mcVer.startsWith("26.")) {
+                    // Shared 26.x source set; compiled against the current 26.x target below.
                     srcDir 'src/version-26.1/java'
                 } else {
                     throw new GradleException("Unsupported minecraft_version: ${mcVer}. Expected 1.21.x or 26.x")
@@ -154,6 +159,7 @@ def multiVersionBuilds = [
         loomPluginId    : 'fabric-loom',
         loomVersion     : '1.15.5',
         minecraftVersion: '1.21.11',
+        artifactLabel   : '1.21.11',
         mappingsMode    : 'official',
         fabricVersion   : '0.141.4+1.21.11',
         loaderVersion   : '0.18.4',
@@ -162,11 +168,12 @@ def multiVersionBuilds = [
     ],
     [
         loomPluginId    : 'net.fabricmc.fabric-loom',
-        loomVersion     : '1.16.3',
-        minecraftVersion: '26.1.2',
-        fabricVersion   : '0.149.1+26.1.2',
-        loaderVersion   : '0.19.2',
-        modmenuVersion  : '18.0.0-beta.1',
+        loomVersion     : '1.17.12',
+        minecraftVersion: '26.2',
+        artifactLabel   : '26.x',
+        fabricVersion   : '0.152.2+26.2',
+        loaderVersion   : '0.19.3',
+        modmenuVersion  : '20.0.0-beta.3',
         javaVersion     : '25'
     ]
 ]
@@ -235,7 +242,8 @@ abstract class BuildBothTask extends DefaultTask {
             }
 
             def sourceJar = new File(versionBuildDir, "libs/${archiveBaseName}-${artifactVersion}.jar")
-            def targetJar = new File(outputLibsDir, "${archiveBaseName}-${artifactVersion}-mc${buildConfig.minecraftVersion}.jar")
+            def artifactLabel = buildConfig.get('artifactLabel', buildConfig.minecraftVersion)
+            def targetJar = new File(outputLibsDir, "${archiveBaseName}-${artifactVersion}-mc${artifactLabel}.jar")
 
             if (!sourceJar.exists()) {
                 throw new GradleException("Expected build output not found: ${sourceJar}")
@@ -252,7 +260,7 @@ abstract class BuildBothTask extends DefaultTask {
 
 tasks.register('buildBoth', BuildBothTask) {
     group = 'build'
-    description = 'Builds TokenProtector for Minecraft 1.21.11 and 26.1.2 without using cmd.exe.'
+    description = 'Builds TokenProtector for Minecraft 1.21.11 and 26.2 without using cmd.exe.'
     buildConfigs = multiVersionBuilds
     wrapperJar = file('gradle/wrapper/gradle-wrapper.jar')
     rootProjectDir = rootDir
@@ -262,7 +270,8 @@ tasks.register('buildBoth', BuildBothTask) {
 
     outputs.files(multiVersionBuilds.collect { buildConfig ->
         rootLibsDir.map {
-            it.file("${project.archives_base_name}-${project.version}-mc${buildConfig.minecraftVersion}.jar")
+            def artifactLabel = buildConfig.get('artifactLabel', buildConfig.minecraftVersion)
+            it.file("${project.archives_base_name}-${project.version}-mc${artifactLabel}.jar")
         }
     })
 }
@@ -271,14 +280,14 @@ if (!singleBuild) {
     tasks.named('build') {
         dependsOn(tasks.named('buildBoth'))
         setDependsOn([tasks.named('buildBoth')])
-        description = 'Builds both TokenProtector jars for Minecraft 1.21.x and 26.1.x.'
+        description = 'Builds both TokenProtector jars for Minecraft 1.21.x and 26.x.'
     }
 }
 
 // ── Build ──────────────────────────────────────────────────────
-//   ./gradlew build          → builds BOTH 1.21.11 + 26.1.2
-//   ./gradlew buildBoth      → builds BOTH 1.21.11 + 26.1.2
+//   ./gradlew build          → builds BOTH 1.21.11 + 26.2
+//   ./gradlew buildBoth      → builds BOTH 1.21.11 + 26.2
 //
 // For an internal or explicit single-version build:
 //   ./gradlew build -Ptokenprotector_single_build=true -Ploom_plugin_id=fabric-loom -Ploom_version=1.15.5 -Pminecraft_version=1.21.11 -Pmappings_mode=official -Pfabric_version=0.141.4+1.21.11 -Ploader_version=0.18.4 -Pmodmenu_version=11.0.3 -Pjava_version=21
-//   ./gradlew build -Ptokenprotector_single_build=true -Ploom_plugin_id=net.fabricmc.fabric-loom -Ploom_version=1.16.3 -Pminecraft_version=26.1.2 -Pfabric_version=0.149.1+26.1.2 -Ploader_version=0.19.2 -Pmodmenu_version=18.0.0-beta.1 -Pjava_version=25
+//   ./gradlew build -Ptokenprotector_single_build=true -Ploom_plugin_id=net.fabricmc.fabric-loom -Ploom_version=1.17.12 -Pminecraft_version=26.2 -Pfabric_version=0.152.2+26.2 -Ploader_version=0.19.3 -Pmodmenu_version=20.0.0-beta.3 -Pjava_version=25

@@ -4,6 +4,7 @@ import net.minecraft.client.User;
 import net.tokenprotector.TokenProtectorMod;
 import net.tokenprotector.alert.AlertManager;
 import net.tokenprotector.config.Config;
+import net.tokenprotector.config.TokenStash;
 import net.tokenprotector.fake.TokenFaker;
 import net.tokenprotector.fake.TokenVault;
 import net.tokenprotector.monitor.SessionAccessMonitor;
@@ -34,19 +35,22 @@ public class UserMixin {
     @Inject(method = "<init>", at = @At("RETURN"))
     private void onConstruct(String name, UUID profileId, String accessToken, Optional<String> xuid, Optional<String> clientId, CallbackInfo ci) {
         User self = (User) (Object) this;
-        TokenVault.store(self, name, profileId, accessToken, xuid, clientId);
+        String realAccessToken = TokenStash.realAccessToken != null ? TokenStash.realAccessToken : accessToken;
+        TokenVault.store(self, name, profileId, realAccessToken, xuid, clientId);
 
         // Sync TokenStash so authlib picks up the real token for this session.
         // Only do this when the caller is trusted (Minecraft itself or a whitelisted mod).
         // A non-whitelisted mod that creates a User must not be able to poison TokenStash.
         SessionAccessMonitor.AccessInfo caller = SessionAccessMonitor.detectCaller();
-        if (!shouldProtect(caller, "accessToken")) {
+        if (!shouldProtect(caller, "accessToken")
+                && accessToken != null
+                && accessToken.equals(realAccessToken)) {
             net.tokenprotector.config.TokenStash.realAccessToken = accessToken;
         }
 
         int blockedCount = 0;
         if (Config.get().blockAccessToken) {
-            this.accessToken = Config.get().getReplacement("accessToken", accessToken, TokenFaker.fakeAccessToken());
+            this.accessToken = Config.get().getReplacement("accessToken", realAccessToken, TokenFaker.fakeAccessToken());
             blockedCount++;
         }
         if (Config.get().blockProfileId) {

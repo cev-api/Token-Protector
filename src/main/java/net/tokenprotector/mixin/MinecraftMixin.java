@@ -24,7 +24,7 @@ public class MinecraftMixin {
             ),
             index = 0
     )
-    private String restoreRealTokenForAuthlib(String poisonedToken) {
+    private static String restoreRealTokenForAuthlib(String poisonedToken) {
         String real = TokenStash.realAccessToken;
         if (real != null && !real.equals(poisonedToken)) {
             Log.info(

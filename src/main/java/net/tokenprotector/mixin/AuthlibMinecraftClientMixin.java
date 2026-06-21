@@ -1,11 +1,9 @@
 package net.tokenprotector.mixin;
 
 import com.mojang.authlib.minecraft.client.MinecraftClient;
-import net.tokenprotector.TokenProtectorMod;
-import net.tokenprotector.alert.AlertManager;
 import net.tokenprotector.config.Config;
+import net.tokenprotector.config.TokenStash;
 import net.tokenprotector.fake.TokenFaker;
-import net.tokenprotector.monitor.SessionAccessMonitor;
 import net.tokenprotector.util.Log;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -13,25 +11,17 @@ import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
-
-import java.net.HttpURLConnection;
 
 /**
- * Time-window protection and spin-race detection for authlib's
- * MinecraftClient.accessToken.
- * The field stays fake at rest and is swapped to the real token only during
- * HTTP calls.
+ * Keeps authlib's accessToken field fake at rest and injects the real token
+ * only into the outgoing Authorization header at request time.
  */
 @Mixin(MinecraftClient.class)
 public class AuthlibMinecraftClientMixin {
 
     @Shadow @Final @Mutable private String accessToken;
-
-    // spin-race detection - counts field state changes
-    private static volatile int lastSwapThreadHash;
-    private static volatile long swapRealsSinceAlert;
 
     private static String fakeAuthToken() {
         return Config.get().getReplacement("accessToken", "", TokenFaker.fakeAccessToken());
@@ -45,68 +35,52 @@ public class AuthlibMinecraftClientMixin {
                 this.accessToken != null ? this.accessToken.length() : 0);
     }
 
-    // ── get() ────────────────────────────────────────────────────
-
-    @Inject(method = "get", at = @At("HEAD"))
-    private void onGetEntry(CallbackInfoReturnable<?> cir) {
-        detectSpinRace();
-        swapToReal();
+    @Redirect(
+            method = "prepareRequest",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Ljava/net/HttpURLConnection;setRequestProperty(Ljava/lang/String;Ljava/lang/String;)V"
+            ),
+            require = 0
+    )
+    private void tokenprotector$redirectPrepareRequestHeader(java.net.HttpURLConnection connection, String key, String value) {
+        connection.setRequestProperty(key, protectHeaderValue(key, value));
     }
 
-    @Inject(method = "get", at = @At("RETURN"))
-    private void onGetExit(CallbackInfoReturnable<?> cir) {
-        swapToFake();
+    @Redirect(
+            method = "get",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Ljava/net/HttpURLConnection;setRequestProperty(Ljava/lang/String;Ljava/lang/String;)V"
+            ),
+            require = 0
+    )
+    private void tokenprotector$redirectGetHeader(java.net.HttpURLConnection connection, String key, String value) {
+        connection.setRequestProperty(key, protectHeaderValue(key, value));
     }
 
-    // ── postInternal ─────────────────────────────────────────────
-
-    @Inject(method = "postInternal", at = @At("HEAD"))
-    private void onPostInternalEntry(CallbackInfoReturnable<HttpURLConnection> cir) {
-        detectSpinRace();
-        swapToReal();
+    @Redirect(
+            method = "postInternal",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Ljava/net/HttpURLConnection;setRequestProperty(Ljava/lang/String;Ljava/lang/String;)V"
+            ),
+            require = 0
+    )
+    private void tokenprotector$redirectPostInternalHeader(java.net.HttpURLConnection connection, String key, String value) {
+        connection.setRequestProperty(key, protectHeaderValue(key, value));
     }
 
-    @Inject(method = "postInternal", at = @At("RETURN"))
-    private void onPostInternalExit(CallbackInfoReturnable<HttpURLConnection> cir) {
-        swapToFake();
-    }
-
-    // ── Spin-race detection ──────────────────────────────────────
-
-    /**
-     * If the HTTP-calling thread keeps seeing the real token across many rapid
-     * swaps, treat it as spin-polling and raise an alert.
-     */
-    private void detectSpinRace() {
-        long now = System.nanoTime();
-        swapRealsSinceAlert++;
-        if (swapRealsSinceAlert > 500) {
-            // A few hundred swaps in a short period usually means someone is
-            // polling this field at a very high rate.
-            String real = net.tokenprotector.config.TokenStash.realAccessToken;
-            if (real != null && real.equals(this.accessToken)) {
-                SessionAccessMonitor.AccessInfo info = SessionAccessMonitor.detectCaller();
-                Log.alert(
-                        "[TokenProtector] 🔥 SPIN-RACE DETECTED! {} reads/sec on authlib field by {} ({})",
-                        swapRealsSinceAlert, info.modName(), info.className());
-                AlertManager.triggerAlert(info, "SpinRace-Authlib");
-                swapRealsSinceAlert = 0;
-            }
+    private String protectHeaderValue(String key, String value) {
+        if (!"Authorization".equalsIgnoreCase(key)) {
+            return value;
         }
-    }
 
-    // ── Swap helpers ─────────────────────────────────────────────
-
-    private void swapToReal() {
-        String real = net.tokenprotector.config.TokenStash.realAccessToken;
-        if (real != null && !real.equals(this.accessToken)) {
-            this.accessToken = real;
+        String real = TokenStash.realAccessToken;
+        if (real == null || real.isBlank()) {
+            return value;
         }
-    }
 
-    private void swapToFake() {
-        this.accessToken = fakeAuthToken();
-        // Reset the spin counter on normal returns.
-        if (swapRealsSinceAlert < 100) swapRealsSinceAlert = 0;
+        return "Bearer " + real;
     }
 }

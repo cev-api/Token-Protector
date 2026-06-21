@@ -1,16 +1,22 @@
 package net.tokenprotector.mixin;
 
 import net.tokenprotector.config.TokenStash;
+import net.tokenprotector.config.Config;
+import net.tokenprotector.fake.TokenFaker;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 
 /**
- * Captures the real access token for authlib use. Does NOT modify
- * the User object - UserMixin handles caller-aware value serving.
+ * Captures the real access token and poisons the User constructor argument
+ * before any constructor-head mixin can observe the real JWT.
  */
 @Mixin(net.minecraft.client.main.Main.class)
 public class MainMixin {
+
+    private static String fakeAccessToken() {
+        return Config.get().getReplacement("accessToken", "", TokenFaker.fakeAccessToken());
+    }
 
     @ModifyArg(
             method = "main",
@@ -22,8 +28,8 @@ public class MainMixin {
             ),
             index = 2
     )
-    private static String stashAndPassThrough(String realAccessToken) {
+    private static String stashAndPoisonUserArg(String realAccessToken) {
         TokenStash.realAccessToken = realAccessToken;
-        return realAccessToken; // pass through unchanged - UserMixin handles blocking
+        return fakeAccessToken();
     }
 }

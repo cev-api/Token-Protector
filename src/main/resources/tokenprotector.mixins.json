@@ -5,10 +5,11 @@
     "mixins": [],
     "client": [
         "AuthlibMinecraftClientMixin",
+        "ClientHandshakePacketListenerImplMixin",
         "MainMixin",
-        "MinecraftMixin",
         "ScreenMixin",
-        "UserMixin"
+        "UserMixin",
+        "YggdrasilAuthenticationServiceMixin"
     ],
     "injectors": {
         "defaultRequire": 1

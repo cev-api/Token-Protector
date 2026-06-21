@@ -1,106 +1,53 @@
-# Minecraft Token Protection Writeup
+# Token Protection Writeup
 
 ## Overview
 
-This document explains how the my Token Protector Fabric mod was developed, what it achieved, and why the real security boundary is not just the JVM. It also describes the different types of token reads, why there are so many attack vectors, why obfuscation is easy for stealers, and why OS-level attacks cannot be blocked by a Fabric mod.
+This document explains how TokenProtector defends the Minecraft session token, why the real security boundary is not just the JVM, the different types of token reads, why there are so many attack vectors, why obfuscation is easy for stealers, and why OS-level attacks cannot be blocked by a Fabric mod.
 
 ---
 
-## Development story
+## Defense layers
 
-### 1. Start with the flow
+TokenProtector uses multiple overlapping layers so that no single bypass undoes the protection.
 
-The project began by mapping the Minecraft 26.1.2 authentication pipeline:
+### 1. Bootstrap interception (MainMixin)
 
-- PrismLauncher passes `--accessToken` to the game process.
-- Minecraft constructs a `net.minecraft.client.User` instance.
-- Minecraft initializes authlib through `Minecraft.createUserApiService()`.
-- `com.mojang.authlib.minecraft.client.MinecraftClient` holds the token for Mojang HTTP calls.
-- The game calls Mojang APIs for login, multiplayer, skins, and Realms.
+`MainMixin` intercepts the `new User(...)` call in `Main.main()` via `@ModifyArg`. Before any other mod's constructor mixin fires, the real JWT is stashed into `TokenStash.realAccessToken` and a fake token is substituted as the `accessToken` constructor argument. A malicious `@Inject(method="<init>", at=@At("HEAD"))` on `User` sees only the fake value.
 
-That flow reveals two key facts:
+### 2. Field poisoning (UserMixin)
 
-1. The real token must reach authlib.
-2. Every mod in `mods/` can inspect game objects and reflection paths.
+`UserMixin` fires at `@At("RETURN")` of the `User` constructor. It reads `TokenStash.realAccessToken` as the source of truth and stores the real session values in `TokenVault`. Then it overwrites every visible `User` field (`accessToken`, `uuid`, `xuid`, `clientId`, `name`) with configurable fake replacements.
 
-### 2. Build a validation harness first
+All public getters (`getAccessToken()`, `getSessionId()`, etc.) are also intercepted and return fake values to unauthorized callers.
 
-A separate token-reader app was built as a read-only probe suite. It does not mutate game state. Instead, it tests every suspected path and writes the result to a text file.
+### 3. Authlib protection
 
-This harness makes the protection measurable. It answers the core question:
+`com.mojang.authlib.minecraft.client.MinecraftClient.accessToken` is kept fake at rest. Deep hooks on authlib methods (`get`, `post`, `postInternal`, `prepareRequest`) see the fake value - normal field reads never expose the real JWT.
 
-- "Can a mod read the real token even if another mod actively tries to block it?"
+The real token is reintroduced only through narrow protected call-site redirects at the exact Mojang auth paths that need it (join server, refresh, etc.). It is never restored into the public authlib field for normal request building.
 
-### 2.5. Build the stealer before the protector
+### 4. Spin-race protection
 
-The token-reader itself was written as a Fabric mod that behaves like a malicious stealer.
-It uses 90+ distinct probe methods across 11 categories, including both obvious attacks and exotic, esoteric, obfuscated reads.
-That approach ensures the protection is not just "good enough for simple mods" but robust against real attacker behavior.
+Because `MinecraftClient.accessToken` stays fake at rest, polling that field at high speed with `Unsafe` only returns the fake value. The traditional "read one field 20 million times per second" spin-race does not work - there is no window where the real token briefly appears in that field.
 
-**Due to the malicious nature of the mod, it won't be released to the public.** It is simply far too easy to convert into actual malware and may be used as a learning tool to obfuscate token reading.
+Connection-level spin-races also fail. A race on `URLConnection.requests` (Unsafe→`MessageHeader`) that waits for the header map to materialize mid-connection still finds no `Authorization` header, because the real token is never written to the connection object's header map. The `Authorization` header is set at a lower JDK socket level that a normal Fabric mod cannot hook easily.
 
-### 3. Add multiple defensive layers
+A bypass would require a much harder bytecode-level interception of the exact protected auth redirect path or native socket interception, not a field-read race. Even that is detectable as suspicious behavior.
 
-The Token Protector’s design is intentionally layered:
+### 5. Side-channel and polling detection
 
-- Stash the real token away from mod-visible objects.
-- Poison every `User` field and getter that a mod can see.
-- Keep authlib’s internal token fake at rest.
-- Only restore the real token for the exact instant an HTTP request is sent.
-- Detect rapid polling and suspicious side-channel probes.
-
-### 4. Validate iteratively
-
-After every defensive change, the token reader is run again. This is why the reader had so many different methodologies and was exhaustive.
-
-The result is a protection model where every mod-visible path returns fake data, while Mojang API access still works.
-
----
-
-## What it achieved
-
-![Graphic](https://i.imgur.com/G0UHemM.png)
-
-### Complete JVM-side protection against normal mods
-
-My Token Protector shows that a Fabric mod can successfully block these token reads:
-
-- `User.getAccessToken()` and all normal public accessors.
-- `User.getSessionId()` — blocked through the same call-stack check as `getAccessToken()`.
-- Java reflection on `User` field values.
-- `Unsafe.getObject(...)` reads on the same fields.
-- `VarHandle` and `MethodHandle` access paths.
-- Legacy session class names from old Minecraft versions.
-- Obfuscated name lookups designed to evade simple string matching.
-
-### Real auth still works
-
-The real token is still delivered to Mojang authlib through a separate channel.
-
-That means:
-
-- Multiplayer login succeeds.
-- Skins and capes still load.
-- Realms access still works.
-
-### The protector identifies advanced attacks
-
-The system also tracks suspicious behavior:
+TokenProtector tracks suspicious behavior patterns:
 
 - rapid authlib token polling,
 - repeated unsafe field reads,
 - legacy/unmapped token probes,
 - launcher/OS token exposure.
 
-This is critical because the remaining risk is not a normal getter but a timing/side-channel attack.
+---
 
-### The authlib deep-hook and spin-race edge case
+### Real auth still works
 
-Two boundary-pushing probes still test the edges of the protection model.
-
-**The authlib deep hook** (`postInternal` → `setRequestProperty`) was the attack vector raised by the Ratter Scanner community. The concern was that hooking deeper than `User` - into the HTTP layer where authlib actually sends the token - would bypass the protector. Testing proved this is blocked: `MinecraftClient.accessToken` is fake at rest, so the `Authorization: Bearer` header sent to Mojang contains `FAKE_TOKEN_LOL`.
-
-**The spin-race** polls `MinecraftClient.accessToken` at maximum speed during server joins, trying to catch the ~7ms window when TokenProtector restores the real token for an HTTP request. This is the only probe that can still capture the real JWT. TokenProtector does not fail quietly - it detects the behavior, flags it as a `🔴 SPIN-RACE DETECTED` alert, and the attempt is logged. This is a noisy, CPU-spiking attack that no known stealer mod uses.
+Multiplayer login, skins, capes, and Realms all function because the real token is delivered to Mojang's auth endpoints through the narrow protected redirects - not through the normal public getters or fields that mods can read.
 
 ---
 
@@ -196,31 +143,33 @@ A protection mod must verify that even these internal objects do not leak the re
 
 ### 8. Constructor-time capture
 
-The token reader also hooks key lifecycle moments:
+The token reader hooks key lifecycle moments where a stealer is most likely to read a token:
 
 - when the client starts connecting to a server,
 - when the handshake begins,
 - when `MinecraftClient` is constructed.
 
-These are the moments a stealer is most likely to read a token.
+Bootstrap-boundary constructor argument capture does not work. A malicious `@Inject(method="<init>", at=@At("HEAD"))` on `User` sees only the fake `accessToken` parameter because `MainMixin` intercepts the `new User(...)` call via `@ModifyArg` and substitutes a fake token before any observer fires. The real JWT is already in `TokenStash.realAccessToken` by then, and `UserMixin` uses that as the source of truth so `TokenVault` still receives the real value for protected auth paths.
 
-### 8.5. Authlib HTTP-layer deep hooks
+### 9. Concurrent time-window attack (spin-race)
 
-The reviewer from the Ratter Scanner Discord specifically asked about hooking `HttpURLConnection.setRequestProperty`. Since JDK classes cannot be targeted by Mixin (they load pre-Mixin), the practical stealer approach is to hook authlib instead.
+This probe polls `MinecraftClient.accessToken` at extreme speed during server join, hoping to catch the real JWT in a brief window where authlib temporarily holds it. This does not succeed against TokenProtector because `MinecraftClient.accessToken` stays fake at rest - the real token is never written into that public field. Polling it at any speed only returns the fake value.
 
-These probes intercept every HTTP entry point on `MinecraftClient`:
+### 9.5. Post-call connection probes
 
-- `postInternal` - the exact method the reviewer described, where `connection.setRequestProperty("Authorization", "Bearer " + this.accessToken)` is called
-- `get` and both `post` overloads - the public methods that all route through `postInternal`
-- `createUrlConnection` - the connection factory called before auth headers are set
+These probes hook authlib's `getWithEtag`/`postWithEtag` at `RETURN` - after the full HTTP cycle completes - and inspect the `URLConnection` object:
 
-All showed `FAKE_TOKEN_LOL` during live testing, confirming the Bearer header never contains the real JWT.
+- `connection.getRequestProperty("Authorization")` - checks if the header was set during the connect/read phase
+- Unsafe access to `URLConnection.requests` (the internal `MessageHeader` map) - may be materialized post-call
+- `URLConnection.connected` - confirms the socket was established
 
-### 9. Concurrent time-window attack
+These probes test whether the protector injects the real token into the connection object during the connect or read phase, rather than at the `prepareRequest` point (where headers are still null). This does not succeed because the real token is never placed into the connection's header map - the `Authorization` header is set at a lower JDK socket layer.
 
-The final probe is a spin-race.
+### 9.6. Connection spin-race (materialization-tolerant)
 
-It polls `MinecraftClient.accessToken` at extreme speed during server join. If the protector only swaps tokens slowly, the real JWT can be caught in the small window when authlib temporarily restores it for an HTTP request.
+Unlike the authlib field race, this probe targets the `URLConnection` object directly. It spins on `Unsafe.getObject(connection, requestsOffset)` in a tight loop for up to 10 seconds, waiting for the internal `MessageHeader` map to materialize (pop from null to an actual object) mid-connection. Once materialized, it switches to the fast Unsafe→`MessageHeader` path and races on header inspection.
+
+This does not succeed because the `Authorization` header is never added to the connection's header map. The real token bypasses `URLConnection.getRequestProperty()` / `requests` entirely; it is set at a lower socket-write level.
 
 ### 10. OS-level process probing
 
@@ -289,65 +238,6 @@ So the defender must protect the data, not just block specific names.
 
 ---
 
-## The "hook deeper than the protector" challenge
-
-During a review in the Ratter Scanner Discord, a valid concern was raised:
-
-> "What prevents an attacker from hooking simply deeper than TokenProtector currently does? In the latest version of Minecraft (26.1.2), `postInternal` calls `HttpURLConnection.setRequestProperty` to add the accessToken in the Authorization header. That means an attacker could hook `setRequestProperty` instead to grab the token."
-
-This is a legitimate question. If the protector only guards `User`/`Session`-level access, a stealer that mixes into authlib's HTTP layer would bypass it entirely. The reviewer was specifically describing the `MinecraftClient.postInternal` → `connection.setRequestProperty("Authorization", "Bearer " + accessToken)` chain.
-
-### Testing the claim
-
-To test this, the TokenReader harness was extended with deep-hook probes on every authlib HTTP entry point:
-
-- `MinecraftClient.postInternal(URL, byte[])` - the private method that creates the `HttpURLConnection` and sets the `Authorization: Bearer` header
-- `MinecraftClient.get(URL, Class)` - all public GET requests
-- `MinecraftClient.post(URL, Class)` - public POSTs with no body  
-- `MinecraftClient.post(URL, Object, Class)` - public POSTs with body (including session join)
-- `MinecraftClient.createUrlConnection(URL)` - the method that creates the connection object before auth headers are set
-
-These hooks read `MinecraftClient.accessToken` at the exact moment the HTTP request is about to be sent, and capture the full call stack to prove the call originates from Mojang auth code.
-
-### Result: blocked
-
-Every deep-hook intercept showed `FAKE_TOKEN_LOL`. The TokenProtector's poisoning of `MinecraftClient.accessToken` at the field level propagates all the way through:
-
-```
-postInternal HEAD  → accessToken = FAKE_TOKEN_LOL
-post (joinServer)  → accessToken = FAKE_TOKEN_LOL
-get (blocklist)    → accessToken = FAKE_TOKEN_LOL
-get (certificates) → accessToken = FAKE_TOKEN_LOL
-```
-
-The `Authorization: Bearer <token>` header sent to Mojang's servers contains the fake token - not the real one.
-
-### Why not hook `HttpURLConnection.setRequestProperty` directly?
-
-The reviewer suggested hooking `HttpURLConnection.setRequestProperty` - the JDK class itself. This was attempted. It crashed:
-
-```
-MixinTargetAlreadyLoadedException: target java.net.URLConnection was loaded too early.
-```
-
-You cannot `@Mixin` JDK classes in a Fabric mod. They're loaded during JVM bootstrap, before the Mixin subsystem initializes. A real stealer has the same constraint - it *must* hook authlib classes instead of JDK classes.
-
-An alternative approach using `URL.setURLStreamHandlerFactory()` to wrap all HTTP connections was also tested. It crashed on Java 25 because `sun.net.www.protocol.http.Handler` is locked inside the `java.base` module and not exported to unnamed modules.
-
-The practical conclusion: a stealer's only viable deep-hook target is `MinecraftClient.postInternal` - and that path is already covered by TokenProtector's field-level poisoning.
-
-### The only remaining bypass
-
-The spin-race probe (polling `MinecraftClient.accessToken` at ~24M reads/sec) can catch the real JWT during the ~7ms window when TokenProtector temporarily swaps it for an actual HTTP call. This requires:
-
-- `sun.misc.Unsafe` access
-- Exact field offset discovery
-- A tight polling loop consuming significant CPU
-
-No known stealer mod uses this technique. It is noisy, detectable, and TokenProtector already flags rapid authlib polling as suspicious behavior.
-
----
-
 ## Why obfuscation is easy for stealers
 
 A stealer does not need to be a full malware product.
@@ -387,7 +277,7 @@ Examples:
 
 A Fabric mod cannot alter the OS process listing, the environment, or the launcher’s behavior after the game starts.
 
-### What my Token Protector mod can do
+### What the mod can do
 
 A mod can only:
 
@@ -412,30 +302,21 @@ A good protection strategy is therefore:
 
 ## Summary
 
-The development of my Token Protector proves that a Fabric mod can harden Minecraft 26.1.2 against common token-stealing techniques by:
+TokenProtector hardens Minecraft against common token-stealing techniques through overlapping defensive layers:
 
-- isolating the real token from mod-visible objects,
-- poisoning all exposed values,
-- detecting side-channel polling,
-- and validating the result with a broad probe suite.
+- **Bootstrap interception** - the real JWT is stashed before any other mod's `User` constructor hook fires; the constructor argument itself is poisoned.
+- **Field and getter poisoning** - every visible `User` field and getter returns fake values to unauthorized callers.
+- **Authlib protection** - `MinecraftClient.accessToken` stays fake at rest; the real token is only reintroduced at the narrow auth endpoints that need it.
+- **Spin-race protection** - polling `MinecraftClient.accessToken` or `URLConnection` headers at any speed returns the fake value because the real token never enters those objects. Connection-level materialization-tolerant races also find no `Authorization` header.
+- **Side-channel detection** - suspicious polling, repeated unsafe reads, and legacy probes are tracked and surfaced.
 
-It is important to understand the gap it closes:
+Over 90 probe methods across 11 categories have been tested: public APIs, reflection, legacy names, obfuscation, unsafe memory access, authlib internals, constructor-time reads, post-call connection probes, and connection-level spin-races. All return fake data to unauthorized callers while multiplayer, skins, and Realms continue to work through protected auth redirects.
 
-- 90+ methods were tested, including public APIs, reflection, legacy names, obfuscation, unsafe memory access, authlib internals, and constructor-time reads.
-- The only remaining test that can still see the token is a spin-race timing attack during the authlib HTTP window.
-- That spin race is not a silent failure mode; it is noisy and detectable, which is significantly better than allowing silent token theft.
-
-So yes - this is sufficient to block the practical mod-level attack surface, and it is far better than nothing.
-
-It also proves that some attacks are simply outside the mod’s control:
+Some attacks are outside the scope of a Fabric mod:
 
 - command-line leaks,
 - environment variable leaks,
 - launcher-side token storage,
 - and disk-based credential files.
 
-That is why the final recommendation is:
-
-- use Token Protector to defend the JVM layer,
-- use a trusted launcher and OS configuration for the process layer,
-- and keep the validation harness as a separate audit tool.
+The recommendation is to combine TokenProtector (JVM layer) with a trusted launcher and OS-level hardening for the process and filesystem layers.
