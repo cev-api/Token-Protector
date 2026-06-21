@@ -40,7 +40,19 @@ public final class SessionAccessMonitor {
                 seenOurCode = true;
                 continue;
             }
-            if (!seenOurCode || isInfrastructure(className)) continue;
+            if (!seenOurCode) continue;
+
+            // Infrastructure frames (net.minecraft.*, com.mojang.*, etc.) are
+            // normally skipped. BUT: Mixin @Inject callbacks from external mods
+            // run inside the target class, so their stack frames show the target
+            // class name (e.g. net.minecraft.client.gui.screens.ConnectScreen)
+            // rather than the mixin class. We detect these by looking for the
+            // Mixin handler method name pattern: handler$<priority>$<config>$<method>
+            if (isInfrastructure(className)) {
+                AccessInfo mixinCaller = detectInjectedMixinCaller(element);
+                if (mixinCaller != null) return mixinCaller;
+                continue;
+            }
 
             ModIdentity mod = identifyMod(className);
             return new AccessInfo(
@@ -54,6 +66,73 @@ public final class SessionAccessMonitor {
         }
 
         return new AccessInfo("internal", "internal", -1, "Minecraft/Internal", null, false);
+    }
+
+    /**
+     * Checks whether a stack frame that looks like infrastructure is actually
+     * an external mod's Mixin @Inject / @ModifyArg / @Redirect callback.
+     * Mixin injects callback methods directly into the target class, so the
+     * class name is the target (net.minecraft.*) but the method name follows
+     * the pattern {@code handler$<priority>$<mixinConfig>$<callbackName>} or
+     * similar.
+     */
+    private static AccessInfo detectInjectedMixinCaller(StackTraceElement element) {
+        String methodName = element.getMethodName();
+        // Mixin handler patterns: handler$<digits>$<config>$<rest>
+        // Also: various redirect/ModifyArg prefixes like
+        //   tokenprotector$redirectPrepareRequestHeader$...
+        int firstDollar = methodName.indexOf('$');
+        if (firstDollar < 0) return null;
+
+        // Skip Java synthetic methods: lambdas (lambda$...), inner-class accessors
+        // (access$...), and generated forwarders that start with $
+        String prefix = methodName.substring(0, firstDollar);
+        if (firstDollar == 0 || prefix.equals("lambda") || prefix.equals("access")) {
+            return null;
+        }
+
+        int secondDollar = methodName.indexOf('$', firstDollar + 1);
+        if (secondDollar < 0) return null;
+
+        int thirdDollar = methodName.indexOf('$', secondDollar + 1);
+        String configName;
+        if (thirdDollar > 0) {
+            // Three-or-more segments: prefix$priorityOrNull$config$rest
+            configName = methodName.substring(secondDollar + 1, thirdDollar);
+        } else {
+            // Two segments only: prefix$config - e.g. redirect/modify-arg callbacks
+            configName = methodName.substring(secondDollar + 1);
+        }
+
+        if (configName.isEmpty() || "tokenprotector".equals(configName)) return null;
+
+        // Map the mixin config name to a Fabric mod
+        for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
+            String modId = container.getMetadata().getId();
+            // Mixin config names often match the mod id, possibly with dashes/underscores
+            if (configName.equalsIgnoreCase(modId)
+                    || configName.replace("-", "").replace("_", "")
+                            .equalsIgnoreCase(modId.replace("-", "").replace("_", ""))) {
+                return new AccessInfo(
+                        element.getClassName(),
+                        element.getMethodName(),
+                        element.getLineNumber(),
+                        container.getMetadata().getName() + " (" + modId + ")",
+                        modId,
+                        true
+                );
+            }
+        }
+
+        // Config name didn't match any mod - still an external caller, just unknown
+        return new AccessInfo(
+                element.getClassName(),
+                element.getMethodName(),
+                element.getLineNumber(),
+                "Unknown Mod [" + configName + "]",
+                null,
+                true
+        );
     }
 
     public static void recordBlockedAccess(AccessInfo info, String field) {

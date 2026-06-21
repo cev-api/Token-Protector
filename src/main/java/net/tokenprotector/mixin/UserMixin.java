@@ -4,6 +4,7 @@ import net.minecraft.client.User;
 import net.tokenprotector.TokenProtectorMod;
 import net.tokenprotector.alert.AlertManager;
 import net.tokenprotector.config.Config;
+import net.tokenprotector.config.TokenStash;
 import net.tokenprotector.fake.TokenFaker;
 import net.tokenprotector.fake.TokenVault;
 import net.tokenprotector.monitor.SessionAccessMonitor;
@@ -34,36 +35,46 @@ public class UserMixin {
     @Inject(method = "<init>", at = @At("RETURN"))
     private void onConstruct(String name, UUID profileId, String accessToken, Optional<String> xuid, Optional<String> clientId, CallbackInfo ci) {
         User self = (User) (Object) this;
-        TokenVault.store(self, name, profileId, accessToken, xuid, clientId);
-
-        // Sync TokenStash so authlib picks up the real token for this session.
-        // Only do this when the caller is trusted (Minecraft itself or a whitelisted mod).
-        // A non-whitelisted mod that creates a User must not be able to poison TokenStash.
         SessionAccessMonitor.AccessInfo caller = SessionAccessMonitor.detectCaller();
-        if (!shouldProtect(caller, "accessToken")) {
-            net.tokenprotector.config.TokenStash.realAccessToken = accessToken;
+
+        // Determine the real access token to store in TokenVault.
+        // For the initial Minecraft session, MainMixin poisons the constructor
+        // arg at the call site and stashes the real JWT in TokenStash. For
+        // whitelisted external mods creating alt accounts, this.accessToken
+        // holds the real JWT (no call-site interception). For untrusted
+        // callers, fall back to TokenStash and poison the field.
+        String realAccessToken;
+        if (!shouldProtect(caller, "accessToken") && caller.externalCaller()
+                && this.accessToken != null && !this.accessToken.isEmpty()) {
+            // Trusted external mod (e.g. whitelisted Wurst) - field has real JWT
+            realAccessToken = this.accessToken;
+            net.tokenprotector.config.TokenStash.realAccessToken = this.accessToken;
+        } else {
+            // Minecraft itself or untrusted caller - rely on TokenStash
+            realAccessToken = TokenStash.realAccessToken != null ? TokenStash.realAccessToken : accessToken;
         }
+        TokenVault.store(self, name, profileId, realAccessToken, xuid, clientId);
 
         int blockedCount = 0;
-        if (Config.get().blockAccessToken) {
-            this.accessToken = Config.get().getReplacement("accessToken", accessToken, TokenFaker.fakeAccessToken());
+        if (Config.get().blockAccessToken && shouldProtect(caller, "accessToken")) {
+            this.accessToken = Config.get().getReplacement("accessToken", realAccessToken, TokenFaker.fakeAccessToken());
             blockedCount++;
         }
-        if (Config.get().blockProfileId) {
+        if (Config.get().blockProfileId && shouldProtect(caller, "profileId")) {
             this.uuid = profileReplacement(profileId);
             blockedCount++;
         }
-        if (Config.get().blockXuid) {
+        if (Config.get().blockXuid && shouldProtect(caller, "xuid")) {
             String replacement = Config.get().getReplacement("xuid", xuid.orElse(""), TokenFaker.fakeXuid());
             this.xuid = Optional.ofNullable(replacement).filter(value -> !value.isBlank());
             blockedCount++;
         }
-        if (Config.get().blockClientId) {
+        if (Config.get().blockClientId && shouldProtect(caller, "clientId")) {
             String replacement = Config.get().getReplacement("clientId", clientId.orElse(""), TokenFaker.fakeClientId());
             this.clientId = Optional.ofNullable(replacement).filter(value -> !value.isBlank());
             blockedCount++;
         }
-        if (Config.get().blockName) {
+        if (Config.get().blockName && shouldProtect(caller, "name")) {
             this.name = Config.get().getReplacement("name", name, TokenFaker.fakeName());
             blockedCount++;
         }

@@ -6,6 +6,7 @@ import net.minecraft.network.chat.Component;
 import net.tokenprotector.config.Config;
 import net.tokenprotector.monitor.SessionAccessMonitor;
 import net.tokenprotector.util.Log;
+import net.tokenprotector.util.MinecraftCompat;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -47,7 +48,7 @@ public final class AlertManager {
         long now = System.currentTimeMillis();
         Minecraft client = Minecraft.getInstance();
 
-        if (client == null || client.getToastManager() == null) {
+        if (client == null || MinecraftCompat.getToastManager(client) == null) {
             // Defer - client not ready yet
             synchronized (deferred) {
                 if (deferred.size() < 20) {
@@ -103,7 +104,7 @@ public final class AlertManager {
     public static void flushIfNeeded() {
         if (flushed || isDeliveringAlert()) return;
         Minecraft client = Minecraft.getInstance();
-        if (client != null && client.getToastManager() != null) {
+        if (client != null && MinecraftCompat.getToastManager(client) != null) {
             deliveringAlert.set(true);
             try {
                 flushDeferred(client);
@@ -147,7 +148,7 @@ public final class AlertManager {
 
     public static void triggerOsLeakAlert(String leakSource, String details) {
         Minecraft client = Minecraft.getInstance();
-        if (client == null || client.getToastManager() == null) {
+        if (client == null || MinecraftCompat.getToastManager(client) == null) {
             synchronized (deferredOsLeaks) {
                 if (deferredOsLeaks.size() < 5) {
                     deferredOsLeaks.add(new PendingOsLeak(leakSource, details));
@@ -159,9 +160,9 @@ public final class AlertManager {
     }
 
     private static void deliverOsLeakAlert(Minecraft client, String leakSource, String details) {
-        if (client.getToastManager() != null) {
+        if (MinecraftCompat.getToastManager(client) != null) {
             try {
-                SystemToast.add(client.getToastManager(),
+                SystemToast.add(MinecraftCompat.getToastManager(client),
                         SystemToast.SystemToastId.PERIODIC_NOTIFICATION,
                         Component.literal("§e⚠ OS Token Leak Detected!"),
                         Component.literal("§6" + leakSource + " §7(cannot block OS calls)")
@@ -181,10 +182,10 @@ public final class AlertManager {
     // ── Toast ─────────────────────────────────────────────────────
 
     private static void showToast(Minecraft client, String modName, String field) {
-        if (client.getToastManager() == null) return;
+        if (MinecraftCompat.getToastManager(client) == null) return;
         try {
             SystemToast.add(
-                    client.getToastManager(),
+                    MinecraftCompat.getToastManager(client),
                     SystemToast.SystemToastId.PERIODIC_NOTIFICATION,
                     Component.literal("§c⚠ Protected Field Access!"),
                     Component.literal("§6" + modName + " §7→ §c" + field)

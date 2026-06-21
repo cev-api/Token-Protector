@@ -53,7 +53,7 @@ public abstract class ScreenMixin {
                         Component.literal("TokenProtector Detections: " + count),
                         b -> {
                             SessionAccessMonitor.acknowledgeAlerts();
-                            minecraft.setScreen(ConfigScreen.openDetections(null));
+                            minecraft.setScreenAndShow(ConfigScreen.openDetections(null));
                         })
                 .bounds(x, 4, bannerWidth, 14)
                 .build();

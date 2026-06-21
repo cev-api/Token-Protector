@@ -28,6 +28,10 @@ public final class TokenVault {
         return VALUES.getOrDefault(user, new SessionValues(name, profileId, accessToken, xuid, clientId));
     }
 
+    public static SessionValues getStored(User user) {
+        return VALUES.get(user);
+    }
+
     public record SessionValues(
             String name,
             UUID profileId,

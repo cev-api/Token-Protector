@@ -6,6 +6,7 @@ import net.tokenprotector.alert.AlertManager;
 import net.tokenprotector.config.Config;
 import net.tokenprotector.monitor.SessionAccessMonitor;
 import net.tokenprotector.util.Log;
+import net.tokenprotector.util.MinecraftCompat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,7 +22,7 @@ public class TokenProtectorMod implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             AlertManager.flushIfNeeded();
-            if (!osScanDone && client.getToastManager() != null) {
+            if (!osScanDone && MinecraftCompat.getToastManager(client) != null) {
                 osScanDone = true;
                 scanForOsLeaks();
             }
@@ -36,15 +37,17 @@ public class TokenProtectorMod implements ClientModInitializer {
         if (cfg.monitorEnvironmentVariables) {
             try {
                 for (var entry : System.getenv().entrySet()) {
-                    String key = entry.getKey().toUpperCase();
-                    if (looksLikeSensitiveKey(key) || looksLikeTokenValue(entry.getValue())) {
-                        String val = entry.getValue();
+                    String key = entry.getKey();
+                    String upperKey = key.toUpperCase();
+                    String val = entry.getValue();
+
+                    if (shouldFlagEnvironmentVariable(upperKey, val)) {
                         boolean isJwt = looksLikeJwt(val);
                         found.incrementAndGet();
-                        SessionAccessMonitor.recordOsLeak("env:" + entry.getKey(), isJwt ? "REAL JWT" : "possible token");
+                        SessionAccessMonitor.recordOsLeak("env:" + key, isJwt ? "REAL JWT" : "possible token");
                         Log.alert(
                                 "[TokenProtector] ⚠ OS LEAK! env '{}' = {} ({})",
-                                entry.getKey(),
+                                key,
                                 isJwt ? "REAL JWT" : "possible token",
                                 val != null ? val.substring(0, Math.min(30, val.length())) + "..." : "null");
                     }
@@ -102,28 +105,109 @@ public class TokenProtectorMod implements ClientModInitializer {
         }
     }
 
+    private static boolean shouldFlagEnvironmentVariable(String upperKey, String value) {
+        if (looksLikePathValue(value) || looksLikeVersionValue(value)) {
+            return false;
+        }
+
+        if (looksLikeTokenValue(value)) {
+            return true;
+        }
+
+        return looksLikeSensitiveKey(upperKey) && looksLikeCredentialValue(value);
+    }
+
     private static boolean looksLikeSensitiveKey(String upperKey) {
         return upperKey.contains("TOKEN")
-                || upperKey.contains("ACCESS")
+                || upperKey.contains("API_KEY")
+                || upperKey.contains("OPENAI")
+                || upperKey.contains("SECRET")
+                || upperKey.contains("SESSION")
+                || upperKey.contains("BEARER")
+                || upperKey.contains("JWT")
+                || upperKey.contains("OAUTH")
                 || upperKey.contains("MINECRAFT")
                 || upperKey.contains("MOJANG")
                 || upperKey.contains("MSA")
                 || upperKey.contains("XBL")
                 || upperKey.contains("XSTS")
-                || upperKey.contains("BEARER")
                 || upperKey.contains("AUTH");
     }
 
     private static boolean looksLikeTokenValue(String value) {
         if (value == null || value.isBlank()) return false;
-        if (looksLikeJwt(value)) return true;
         String v = value.trim();
-        return (v.length() >= 80 && (v.contains(".") || v.matches("^[A-Za-z0-9_\\-]+$")));
+
+        if (looksLikePathValue(v) || looksLikeVersionValue(v)) {
+            return false;
+        }
+
+        if (looksLikeJwt(v)) return true;
+        if (looksLikeOpenAiKey(v)) return true;
+
+        // Long opaque secrets are suspicious, but avoid flagging ordinary prose,
+        // paths, and JVM argument lists.
+        return v.length() >= 80
+                && !v.contains(" ")
+                && !v.contains("\\")
+                && !v.contains("/")
+                && !v.contains("=")
+                && v.matches("^[A-Za-z0-9._\\-]+$");
     }
 
     private static boolean looksLikeJwt(String value) {
         if (value == null) return false;
         String v = value.trim();
-        return v.startsWith("eyJ") || v.matches("^[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+$");
+        if (!v.startsWith("eyJ")) {
+            return false;
+        }
+
+        String[] parts = v.split("\\.");
+        if (parts.length != 3) {
+            return false;
+        }
+
+        // JWTs are three substantial base64url-ish segments, not short version numbers like 26.1.2.
+        return parts[0].length() >= 8
+                && parts[1].length() >= 8
+                && parts[2].length() >= 8
+                && parts[0].matches("^[A-Za-z0-9_\\-]+$")
+                && parts[1].matches("^[A-Za-z0-9_\\-]+$")
+                && parts[2].matches("^[A-Za-z0-9_\\-]+$");
+    }
+
+    private static boolean looksLikeOpenAiKey(String value) {
+        String v = value.trim();
+        return v.startsWith("sk-") && v.length() >= 20;
+    }
+
+    private static boolean looksLikeCredentialValue(String value) {
+        if (value == null || value.isBlank()) return false;
+        String v = value.trim();
+        return looksLikeJwt(v)
+                || looksLikeOpenAiKey(v)
+                || (v.length() >= 24
+                && !looksLikePathValue(v)
+                && !looksLikeVersionValue(v)
+                && !v.contains(" ")
+                && v.matches("^[A-Za-z0-9._\\-]+$"));
+    }
+
+    private static boolean looksLikePathValue(String value) {
+        if (value == null) return false;
+        String v = value.trim();
+        return v.contains("\\")
+                || v.contains(":/")
+                || v.matches("^[A-Za-z]:\\\\.*")
+                || v.contains(";")
+                || v.startsWith("-Duser.")
+                || v.startsWith("-X")
+                || v.startsWith("--");
+    }
+
+    private static boolean looksLikeVersionValue(String value) {
+        if (value == null) return false;
+        String v = value.trim();
+        return v.matches("^\\d+(\\.\\d+){1,3}$");
     }
 }
