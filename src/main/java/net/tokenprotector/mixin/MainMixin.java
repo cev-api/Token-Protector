@@ -1,8 +1,8 @@
 package net.tokenprotector.mixin;
 
-import net.tokenprotector.config.TokenStash;
 import net.tokenprotector.config.Config;
 import net.tokenprotector.fake.TokenFaker;
+import net.tokenprotector.internal.TokenAccess;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
@@ -29,7 +29,7 @@ public class MainMixin {
             index = 2
     )
     private static String stashAndPoisonUserArg(String realAccessToken) {
-        TokenStash.realAccessToken = realAccessToken;
+        TokenAccess.capture(realAccessToken);
         return fakeAccessToken();
     }
 }

@@ -18,14 +18,14 @@ public final class TokenVault {
 
     private TokenVault() {}
 
-    public static void store(User user, String name, UUID profileId, String accessToken,
+    public static void store(User user, String name, UUID profileId,
                              Optional<String> xuid, Optional<String> clientId) {
-        VALUES.put(user, new SessionValues(name, profileId, accessToken, xuid, clientId));
+        VALUES.put(user, new SessionValues(name, profileId, xuid, clientId));
     }
 
-    public static SessionValues get(User user, String name, UUID profileId, String accessToken,
+    public static SessionValues get(User user, String name, UUID profileId,
                                     Optional<String> xuid, Optional<String> clientId) {
-        return VALUES.getOrDefault(user, new SessionValues(name, profileId, accessToken, xuid, clientId));
+        return VALUES.getOrDefault(user, new SessionValues(name, profileId, xuid, clientId));
     }
 
     public static SessionValues getStored(User user) {
@@ -35,7 +35,6 @@ public final class TokenVault {
     public record SessionValues(
             String name,
             UUID profileId,
-            String accessToken,
             Optional<String> xuid,
             Optional<String> clientId
     ) {}

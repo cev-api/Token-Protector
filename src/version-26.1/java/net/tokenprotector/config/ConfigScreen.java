@@ -94,7 +94,7 @@ public class ConfigScreen extends Screen {
     private void buildProtectionPage() {
         int left = width / 2 - 300;
         int y = 54;
-        addPageLabel(left, y, 600, "Choose what external mods receive. Field-level changes apply after restarting Minecraft.");
+        addPageLabel(left, y, 600, "Choose what external mods receive. Token/session NONE is disabled while protection is enabled.");
         y += 18;
         y = addProtectionRow(left, y, "Access Token", config.blockAccessToken, v -> config.blockAccessToken = v,
                 config.accessTokenMode, m -> config.accessTokenMode = m, config.customAccessToken, v -> config.customAccessToken = v);
@@ -169,6 +169,8 @@ public class ConfigScreen extends Screen {
 
         int bx = left + 160;
         for (Config.ReplaceMode candidate : Config.ReplaceMode.values()) {
+            if ((label.equals("Access Token") || label.equals("Session Id"))
+                    && candidate == Config.ReplaceMode.NONE) continue;
             String text = candidate == mode ? "[" + candidate.name() + "]" : candidate.name();
             Button button = Button.builder(Component.literal(text), b -> {
                 modeSetter.accept(candidate);

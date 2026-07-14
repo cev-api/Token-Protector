@@ -2,27 +2,27 @@
 
 ## Overview
 
-This document explains how TokenProtector defends the Minecraft session token, why the real security boundary is not just the JVM, the different types of token reads, why there are so many attack vectors, why obfuscation is easy for stealers, and why OS-level attacks cannot be blocked by a Fabric mod.
+This document explains TokenProtector's hardening of common Minecraft session-token read paths, the different types of token reads, why there are many attack vectors, and why a Fabric mod cannot create a security boundary against hostile code in the same JVM or OS-level attacks.
 
 ---
 
 ## Defense layers
 
-TokenProtector uses multiple overlapping layers so that no single bypass undoes the protection.
+TokenProtector uses multiple overlapping layers to reduce exposure on its covered paths. No Fabric mod can ensure that a hostile peer mod cannot bypass, cancel, or target those layers.
 
 ### 1. Bootstrap interception (MainMixin)
 
-`MainMixin` intercepts the `new User(...)` call in `Main.main()` via `@ModifyArg`. Before any other mod's constructor mixin fires, the real JWT is stashed into `TokenStash.realAccessToken` and a fake token is substituted as the `accessToken` constructor argument. During the initial session handoff, the real JWT is never visible to the `User` constructor at all.
+`MainMixin` intercepts the `new User(...)` call in `Main.main()` via `@ModifyArg`. At this covered boundary, the real JWT is captured in an internal authentication helper and a fake token is substituted as the `accessToken` constructor argument. The tested constructor-time probes see a fake. Code that runs earlier or interferes with mixin transformation/order is outside this guarantee.
 
 ### 2. Field poisoning (UserMixin)
 
-`UserMixin` fires at `@At("RETURN")` of the `User` constructor. It reads `TokenStash.realAccessToken` as the source of truth and stores the real session values in `TokenVault`. Then it overwrites every visible `User` field (`accessToken`, `uuid`, `xuid`, `clientId`, `name`) with configurable fake replacements.
+`UserMixin` fires at `@At("RETURN")` of the `User` constructor. It reads the internal authentication helper as the source of truth and stores non-token session values in `TokenVault`. Then it overwrites every visible `User` field (`accessToken`, `uuid`, `xuid`, `clientId`, `name`) with configurable fake replacements.
 
 All public getters (`getAccessToken()`, `getSessionId()`, etc.) are also intercepted and return fake values to unauthorized callers.
 
 ### 3. Authlib protection
 
-`com.mojang.authlib.minecraft.client.MinecraftClient.accessToken` is kept fake at rest. Deep hooks on authlib methods (`get`, `post`, `postInternal`, `prepareRequest`) see the fake value - normal field reads never expose the real JWT.
+`com.mojang.authlib.minecraft.client.MinecraftClient.accessToken` is kept fake at rest. Version-specific hooks cover the supported authlib methods (`get`, `postInternal`, or `prepareRequest` depending on authlib). The regression probes see the fake value; this does not cover every possible network or egress hook.
 
 The real token is reintroduced only through narrow protected call-site redirects at the exact Mojang auth paths that need it (join server, refresh, etc.). It is never restored into the public authlib field for normal request building.
 
@@ -30,9 +30,9 @@ The real token is reintroduced only through narrow protected call-site redirects
 
 Because `MinecraftClient.accessToken` stays fake at rest, polling that field at high speed with `Unsafe` only returns the fake value. The traditional "read one field 20 million times per second" spin-race does not work - there is no window where the real token briefly appears in that field.
 
-Connection-level spin-races also fail. A race on `URLConnection.requests` (Unsafe→`MessageHeader`) that waits for the header map to materialize mid-connection still finds no `Authorization` header, because the real token is never written to the connection object's header map. The `Authorization` header is set at a lower JDK socket level that a normal Fabric mod cannot hook easily.
+The included connection-level spin-race probe did not observe an `Authorization` header in the inspected `URLConnection.requests` map. That result is specific to the tested path; it does not establish that every header, socket, or third-party network hook is covered.
 
-A bypass would require a much harder bytecode-level interception of the exact protected auth redirect path or native socket interception, not a field-read race. Even that is detectable as suspicious behavior.
+A targeted mod can still attempt bytecode interception of the redirected auth path, an earlier hook, mixin cancellation/priority changes, a JVM agent, or an alternative credential source.
 
 ### 5. Side-channel and polling detection
 
@@ -131,7 +131,7 @@ Why so many? Because real malware does not use plain strings. It reconstructs id
 
 ### 7. Authlib internal chain
 
-The true hard target is authlib’s internal token storage.
+The true hard target is authlib's internal token storage.
 
 That chain includes:
 
@@ -149,7 +149,7 @@ The token reader hooks key lifecycle moments where a stealer is most likely to r
 - when the handshake begins,
 - when `MinecraftClient` is constructed.
 
-Bootstrap-boundary constructor argument capture does not work against the initial session handoff. `MainMixin` intercepts the `new User(...)` call via `@ModifyArg` and substitutes a fake token before any observer fires. The real JWT is already in `TokenStash.realAccessToken` by then, and `UserMixin` uses that as the source of truth so `TokenVault` still receives the real value for protected auth paths. If you whitelist a mod that performs its own `User` construction (e.g. an alt-account manager), that mod is explicitly trusted and certain obscure interception techniques may succeed against its internal operations - TokenProtector cannot prevent a trusted mod from exposing what it has been allowed to access.
+The covered bootstrap boundary substitutes a fake token for `User` construction; the internal helper remains the source for redirected authentication calls. The tested constructor-time probes see a fake, but an earlier observer or mod that interferes with mixin transformation/order is not ruled out. If you whitelist a mod that performs its own `User` construction (e.g. an alt-account manager), that mod is explicitly trusted and may receive real values through the allowed path - TokenProtector cannot prevent a trusted mod from exposing what it has been allowed to access.
 
 ### 9. Concurrent time-window attack (spin-race)
 
@@ -163,13 +163,13 @@ These probes hook authlib's `getWithEtag`/`postWithEtag` at `RETURN` - after the
 - Unsafe access to `URLConnection.requests` (the internal `MessageHeader` map) - may be materialized post-call
 - `URLConnection.connected` - confirms the socket was established
 
-These probes test whether the protector injects the real token into the connection object during the connect or read phase, rather than at the `prepareRequest` point (where headers are still null). This does not succeed because the real token is never placed into the connection's header map - the `Authorization` header is set at a lower JDK socket layer.
+These probes inspect the connection object after the HTTP cycle. The tested probe did not observe the real token or an `Authorization` header in that map. This is a result for that inspected path, not a claim that every connection or socket layer is covered.
 
 ### 9.6. Connection spin-race (materialization-tolerant)
 
-Unlike the authlib field race, this probe targets the `URLConnection` object directly. It spins on `Unsafe.getObject(connection, requestsOffset)` in a tight loop for up to 10 seconds, waiting for the internal `MessageHeader` map to materialize (pop from null to an actual object) mid-connection. Once materialized, it switches to the fast Unsafe→`MessageHeader` path and races on header inspection.
+Unlike the authlib field race, this probe targets the `URLConnection` object directly. It spins on `Unsafe.getObject(connection, requestsOffset)` in a tight loop for up to 10 seconds, waiting for the internal `MessageHeader` map to materialize (pop from null to an actual object) mid-connection. Once materialized, it switches to the fast Unsafe -> `MessageHeader` path and races on header inspection.
 
-This does not succeed because the `Authorization` header is never added to the connection's header map. The real token bypasses `URLConnection.getRequestProperty()` / `requests` entirely; it is set at a lower socket-write level.
+This tested spin-race did not observe an `Authorization` header in the inspected map. It does not establish that a different connection implementation, socket hook, or egress path is protected.
 
 ### 10. OS-level process probing
 
@@ -219,7 +219,7 @@ A stealer can be:
 
 A protection app cannot ignore any of those assumptions.
 
-### “Easy to obfuscate” means “easy to hide from heuristics”
+### Easy to obfuscate means easy to hide from heuristics
 
 Most mod-based token stealers rely on the same underlying read operation: read a String field from a game object.
 
@@ -275,7 +275,7 @@ Examples:
 - `launcher_accounts.json` on disk
 - any native launcher API that exposes secrets
 
-A Fabric mod cannot alter the OS process listing, the environment, or the launcher’s behavior after the game starts.
+A Fabric mod cannot alter the OS process listing, the environment, or the launcher's behavior after the game starts.
 
 ### What the mod can do
 
@@ -310,7 +310,7 @@ TokenProtector hardens Minecraft against common token-stealing techniques throug
 - **Spin-race protection** - polling `MinecraftClient.accessToken` or `URLConnection` headers at any speed returns the fake value because the real token never enters those objects. Connection-level materialization-tolerant races also find no `Authorization` header.
 - **Side-channel detection** - suspicious polling, repeated unsafe reads, and legacy probes are tracked and surfaced.
 
-Over 90 probe methods across 11 categories have been tested: public APIs, reflection, legacy names, obfuscation, unsafe memory access, authlib internals, constructor-time reads, post-call connection probes, and connection-level spin-races. All return fake data to unauthorized callers while multiplayer, skins, and Realms continue to work through protected auth redirects.
+Over 90 probe methods across 11 categories have been tested: public APIs, reflection, legacy names, obfuscation, unsafe memory access, authlib internals, constructor-time reads, post-call connection probes, and connection-level spin-races. With protection enabled and the test mod unwhitelisted, the supported probes returned fake data while multiplayer, skins, and Realms continued to work through protected auth redirects.
 
 Some attacks are outside the scope of a Fabric mod:
 
