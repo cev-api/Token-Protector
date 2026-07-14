@@ -184,6 +184,12 @@ Normal covered in-game getter, reflection, field, and authlib probes receive fak
 
 Yes. Multiplayer, skins, and Realms still work because TokenProtector feeds the real token back only into the narrow auth paths that actually need it.
 
+###  “My Fabric mod is an ecosystem that physically quarantines and controls the other mods in your folder, whereas TokenProtector is a simplistic spoofer that can fail against high-level AES obfuscation.”
+
+Your “ecosystem” is still just one Fabric mod sharing a JVM with the mods it claims to control. It cannot "physically" quarantine peer code. At best, it can detect or block known behavior until another equally privileged mod bypasses it.
+
+And “high-level AES obfuscation” has nothing to do with defeating TokenProtector. AES can hide the name of the field or method the attacker wants to call, but it cannot change the value stored there. Once the malicious mod decrypts the name and reads the token, it still gets the poisoned fake value.
+
 ## Security model
 
 TokenProtector operates entirely within the JVM. It cannot protect against:
