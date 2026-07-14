@@ -8,11 +8,7 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 
-/**
- * Prevents authlib from ever constructing authenticated service clients with
- * the real access token. Outbound HTTP header injection is handled separately
- * by AuthlibMinecraftClientMixin.
- */
+/** Authlib 7.0.x used by Minecraft 1.21.x has no FriendsService factory. */
 @Mixin(YggdrasilAuthenticationService.class)
 public class YggdrasilAuthenticationServiceMixin {
 
@@ -33,23 +29,6 @@ public class YggdrasilAuthenticationServiceMixin {
         String fake = fakeAuthToken();
         if (!fake.equals(originalToken)) {
             Log.info("[TokenProtector] Replaced authlib UserApiService constructor token.");
-        }
-        return fake;
-    }
-
-    @ModifyArg(
-            method = "createFriendsService",
-            at = @At(
-                    value = "INVOKE",
-                    target = "Lcom/mojang/authlib/yggdrasil/YggdrasilFriendsService;<init>(Ljava/lang/String;Ljava/net/Proxy;Lcom/mojang/authlib/Environment;)V"
-            ),
-            index = 0,
-            require = 1
-    )
-    private String tokenprotector$fakeFriendsServiceToken(String originalToken) {
-        String fake = fakeAuthToken();
-        if (!fake.equals(originalToken)) {
-            Log.info("[TokenProtector] Replaced authlib FriendsService constructor token.");
         }
         return fake;
     }
