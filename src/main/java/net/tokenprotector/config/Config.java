@@ -108,6 +108,7 @@ public final class Config {
                     if (cfg.allowedMods == null) cfg.allowedMods = new HashSet<>();
                     if (cfg.allowedModFields == null) cfg.allowedModFields = new HashMap<>();
                     if (cfg.detectionDedupMs == 500) cfg.detectionDedupMs = 10_000;
+                    cfg.normalizeCredentialModes();
                     return cfg;
                 }
             } catch (Exception e) {
@@ -191,8 +192,19 @@ public final class Config {
         }
         return switch (mode) {
             case CUSTOM -> (customVal != null && !customVal.isEmpty()) ? customVal : fakeValue;
-            case NONE   -> realValue;
+            // A disabled replacement is valid for identity metadata, but never for a
+            // reusable credential. Whitelisting remains the explicit opt-in path.
+            case NONE   -> isCredentialField(field) ? fakeValue : realValue;
             default     -> fakeValue;
         };
+    }
+
+    private static boolean isCredentialField(String field) {
+        return "accessToken".equals(field) || "sessionId".equals(field);
+    }
+
+    private void normalizeCredentialModes() {
+        if (accessTokenMode == ReplaceMode.NONE) accessTokenMode = ReplaceMode.FAKE;
+        if (sessionIdMode == ReplaceMode.NONE) sessionIdMode = ReplaceMode.FAKE;
     }
 }

@@ -3,6 +3,7 @@ package net.tokenprotector.mixin;
 import net.minecraft.client.User;
 import net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl;
 import net.tokenprotector.fake.TokenVault;
+import net.tokenprotector.internal.TokenAccess;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
@@ -22,7 +23,7 @@ public class ClientHandshakePacketListenerImplMixin {
                     value = "INVOKE",
                     target = "Lnet/minecraft/client/User;getProfileId()Ljava/util/UUID;"
             ),
-            require = 0
+            require = 1
     )
     private UUID tokenprotector$useStoredProfileId(User user) {
         TokenVault.SessionValues stored = TokenVault.getStored(user);
@@ -35,10 +36,10 @@ public class ClientHandshakePacketListenerImplMixin {
                     value = "INVOKE",
                     target = "Lnet/minecraft/client/User;getAccessToken()Ljava/lang/String;"
             ),
-            require = 0
+            require = 1
     )
     private String tokenprotector$useStoredAccessToken(User user) {
-        TokenVault.SessionValues stored = TokenVault.getStored(user);
-        return stored != null ? stored.accessToken() : user.getAccessToken();
+        String real = TokenAccess.forAuthentication();
+        return real != null ? real : user.getAccessToken();
     }
 }

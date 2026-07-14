@@ -27,7 +27,7 @@ public class YggdrasilAuthenticationServiceMixin {
                     target = "Lcom/mojang/authlib/yggdrasil/YggdrasilUserApiService;<init>(Ljava/lang/String;Ljava/net/Proxy;Lcom/mojang/authlib/Environment;)V"
             ),
             index = 0,
-            require = 0
+            require = 1
     )
     private String tokenprotector$fakeUserApiServiceToken(String originalToken) {
         String fake = fakeAuthToken();
@@ -44,7 +44,7 @@ public class YggdrasilAuthenticationServiceMixin {
                     target = "Lcom/mojang/authlib/yggdrasil/YggdrasilFriendsService;<init>(Ljava/lang/String;Ljava/net/Proxy;Lcom/mojang/authlib/Environment;)V"
             ),
             index = 0,
-            require = 0
+            require = 1
     )
     private String tokenprotector$fakeFriendsServiceToken(String originalToken) {
         String fake = fakeAuthToken();

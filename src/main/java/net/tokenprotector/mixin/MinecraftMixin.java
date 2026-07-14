@@ -1,7 +1,7 @@
 package net.tokenprotector.mixin;
 
 import net.minecraft.client.Minecraft;
-import net.tokenprotector.config.TokenStash;
+import net.tokenprotector.internal.TokenAccess;
 import net.tokenprotector.util.Log;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -25,7 +25,7 @@ public class MinecraftMixin {
             index = 0
     )
     private static String restoreRealTokenForAuthlib(String poisonedToken) {
-        String real = TokenStash.realAccessToken;
+        String real = TokenAccess.forAuthentication();
         if (real != null && !real.equals(poisonedToken)) {
             Log.info(
                     "[TokenProtector] Restoring real token for authlib (len={})", real.length());

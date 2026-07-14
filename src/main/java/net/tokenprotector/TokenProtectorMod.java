@@ -18,7 +18,7 @@ public class TokenProtectorMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        Log.info("TokenProtector initialized - your session tokens are now protected!");
+        Log.info("TokenProtector initialized - session-token hardening is active.");
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             AlertManager.flushIfNeeded();
@@ -49,7 +49,7 @@ public class TokenProtectorMod implements ClientModInitializer {
                                 "[TokenProtector] ⚠ OS LEAK! env '{}' = {} ({})",
                                 key,
                                 isJwt ? "REAL JWT" : "possible token",
-                                val != null ? val.substring(0, Math.min(30, val.length())) + "..." : "null");
+                                diagnosticPreview(val));
                     }
                 }
             } catch (Exception e) {
@@ -209,5 +209,17 @@ public class TokenProtectorMod implements ClientModInitializer {
         if (value == null) return false;
         String v = value.trim();
         return v.matches("^\\d+(\\.\\d+){1,3}$");
+    }
+
+    /**
+     * Enough information to distinguish a likely false positive without writing a usable
+     * credential into the game log. Never return a contiguous long prefix.
+     */
+    private static String diagnosticPreview(String value) {
+        if (value == null) return "null";
+        int length = value.length();
+        if (length <= 8) return "<redacted; len=" + length + ">";
+        return value.substring(0, 4) + "…" + value.substring(length - 4)
+                + " (redacted; len=" + length + ")";
     }
 }

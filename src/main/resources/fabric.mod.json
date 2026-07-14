@@ -3,7 +3,7 @@
     "id": "tokenprotector",
     "version": "${version}",
     "name": "TokenProtector",
-    "description": "TokenProtector prevents malicious mods from stealing your Minecraft session token. It sits between the game's authentication system and every mod in your instance, serving fake token data to unauthorized callers while keeping multiplayer, skins, and Realms fully functional.",
+    "description": "Client-side hardening against common Minecraft session-token reads. It serves fake session data to unauthorized callers while preserving vanilla authentication paths; it is not a security boundary against a hostile mod in the same JVM.",
     "authors": [
         "CevAPI"
     ],

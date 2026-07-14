@@ -1,12 +1,11 @@
 package net.tokenprotector.mixin;
 
 import net.minecraft.client.User;
-import net.tokenprotector.TokenProtectorMod;
 import net.tokenprotector.alert.AlertManager;
 import net.tokenprotector.config.Config;
-import net.tokenprotector.config.TokenStash;
 import net.tokenprotector.fake.TokenFaker;
 import net.tokenprotector.fake.TokenVault;
+import net.tokenprotector.internal.TokenAccess;
 import net.tokenprotector.monitor.SessionAccessMonitor;
 import net.tokenprotector.util.Log;
 import org.spongepowered.asm.mixin.Final;
@@ -37,27 +36,16 @@ public class UserMixin {
         User self = (User) (Object) this;
         SessionAccessMonitor.AccessInfo caller = SessionAccessMonitor.detectCaller();
 
-        // Determine the real access token to store in TokenVault.
-        // For the initial Minecraft session, MainMixin poisons the constructor
-        // arg at the call site and stashes the real JWT in TokenStash. For
-        // whitelisted external mods creating alt accounts, this.accessToken
-        // holds the real JWT (no call-site interception). For untrusted
-        // callers, fall back to TokenStash and poison the field.
-        String realAccessToken;
+        // Capture a trusted alt-account token when one constructs its own User.
         if (!shouldProtect(caller, "accessToken") && caller.externalCaller()
                 && this.accessToken != null && !this.accessToken.isEmpty()) {
-            // Trusted external mod (e.g. whitelisted Wurst) - field has real JWT
-            realAccessToken = this.accessToken;
-            net.tokenprotector.config.TokenStash.realAccessToken = this.accessToken;
-        } else {
-            // Minecraft itself or untrusted caller - rely on TokenStash
-            realAccessToken = TokenStash.realAccessToken != null ? TokenStash.realAccessToken : accessToken;
+            TokenAccess.capture(this.accessToken);
         }
-        TokenVault.store(self, name, profileId, realAccessToken, xuid, clientId);
+        TokenVault.store(self, name, profileId, xuid, clientId);
 
         int blockedCount = 0;
         if (Config.get().blockAccessToken && shouldProtect(caller, "accessToken")) {
-            this.accessToken = Config.get().getReplacement("accessToken", realAccessToken, TokenFaker.fakeAccessToken());
+            this.accessToken = Config.get().getReplacement("accessToken", accessToken, TokenFaker.fakeAccessToken());
             blockedCount++;
         }
         if (Config.get().blockProfileId && shouldProtect(caller, "profileId")) {
@@ -80,14 +68,15 @@ public class UserMixin {
         }
 
         if (blockedCount > 0) {
-            Log.info("[TokenProtector] Protected {} User field(s) at construction (real values stored, fakes served to unauthorized mods)", blockedCount);
+            Log.info("[TokenProtector] Protected {} User field(s) at construction.", blockedCount);
         }
     }
 
     @Inject(method = "getAccessToken", at = @At("RETURN"), cancellable = true)
     private void onGetAccessToken(CallbackInfoReturnable<String> cir) {
         User self = (User) (Object) this;
-        String real = realValues(self).accessToken();
+        String real = TokenAccess.forAuthentication();
+        if (real == null) real = this.accessToken;
 
         SessionAccessMonitor.AccessInfo info = SessionAccessMonitor.detectCaller();
         if (!Config.get().blockAccessToken || !shouldProtect(info, "accessToken")) {
@@ -110,7 +99,9 @@ public class UserMixin {
         SessionAccessMonitor.AccessInfo info = SessionAccessMonitor.detectCaller();
         User self = (User) (Object) this;
         TokenVault.SessionValues values = realValues(self);
-        String real = "token:" + values.accessToken() + ":" + values.profileId().toString().replace("-", "");
+        String token = TokenAccess.forAuthentication();
+        if (token == null) token = this.accessToken;
+        String real = "token:" + token + ":" + values.profileId().toString().replace("-", "");
 
         if (!Config.get().blockSessionId || !shouldProtect(info, "sessionId")) {
             cir.setReturnValue(real);
@@ -199,7 +190,7 @@ public class UserMixin {
 
     @Unique
     private TokenVault.SessionValues realValues(User self) {
-        return TokenVault.get(self, this.name, this.uuid, this.accessToken, this.xuid, this.clientId);
+        return TokenVault.get(self, this.name, this.uuid, this.xuid, this.clientId);
     }
 
     @Unique
