@@ -5,6 +5,9 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.tokenprotector.alert.AlertManager;
 import net.tokenprotector.config.Config;
 import net.tokenprotector.monitor.SessionAccessMonitor;
+import net.tokenprotector.monitor.LaunchSecretScanner;
+import net.tokenprotector.monitor.MixinPostureProbe;
+import net.tokenprotector.monitor.InstrumentationPostureProbe;
 import net.tokenprotector.util.Log;
 import net.tokenprotector.util.MinecraftCompat;
 import org.slf4j.Logger;
@@ -15,6 +18,7 @@ public class TokenProtectorMod implements ClientModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
     private static volatile boolean osScanDone;
+    private static volatile boolean postureScanDone;
 
     @Override
     public void onInitializeClient() {
@@ -26,12 +30,18 @@ public class TokenProtectorMod implements ClientModInitializer {
                 osScanDone = true;
                 scanForOsLeaks();
             }
+            if (!postureScanDone && MinecraftCompat.getToastManager(client) != null) {
+                postureScanDone = true;
+                MixinPostureProbe.runStartupScan();
+                InstrumentationPostureProbe.runClientScan();
+            }
         });
     }
 
     private static void scanForOsLeaks() {
         Config cfg = Config.get();
         java.util.concurrent.atomic.AtomicInteger found = new java.util.concurrent.atomic.AtomicInteger();
+        boolean processScanIncomplete = false;
 
         // Env vars
         if (cfg.monitorEnvironmentVariables) {
@@ -44,11 +54,11 @@ public class TokenProtectorMod implements ClientModInitializer {
                     if (shouldFlagEnvironmentVariable(upperKey, val)) {
                         boolean isJwt = looksLikeJwt(val);
                         found.incrementAndGet();
-                        SessionAccessMonitor.recordOsLeak("env:" + key, isJwt ? "REAL JWT" : "possible token");
+                        SessionAccessMonitor.recordOsLeak("env:" + key, isJwt ? "JWT-shaped value (unverified)" : "possible token");
                         Log.alert(
                                 "[TokenProtector] ⚠ OS LEAK! env '{}' = {} ({})",
                                 key,
-                                isJwt ? "REAL JWT" : "possible token",
+                                isJwt ? "JWT-shaped value (unverified)" : "possible token",
                                 diagnosticPreview(val));
                     }
                 }
@@ -62,9 +72,10 @@ public class TokenProtectorMod implements ClientModInitializer {
             try {
                 for (var entry : System.getProperties().entrySet()) {
                     String key = entry.getKey().toString().toLowerCase();
-                    if (key.contains("token") || key.contains("access") || key.contains("session")) {
+                    if (key.contains("token") || key.contains("access") || key.contains("session")
+                            || LaunchSecretScanner.containsJwtLikeValue(entry.getValue().toString())) {
                         String val = entry.getValue().toString();
-                        if (looksLikeTokenValue(val)) {
+                        if (looksLikeTokenValue(val) || LaunchSecretScanner.containsJwtLikeValue(val)) {
                             found.incrementAndGet();
                             SessionAccessMonitor.recordOsLeak("sysprop:" + entry.getKey(), "possible token");
                             Log.alert("[TokenProtector] ⚠ OS LEAK! sysprop '{}' appears to contain a token", entry.getKey());
@@ -79,29 +90,49 @@ public class TokenProtectorMod implements ClientModInitializer {
         // Process args
         if (cfg.monitorProcessArgs) {
             try {
-                var cmdLine = ProcessHandle.current().info().commandLine();
-                cmdLine.ifPresent(line -> {
-                    if (line.toLowerCase().contains("--accesstoken")) {
-                        found.incrementAndGet();
-                        SessionAccessMonitor.recordOsLeak("process:args", "--accessToken");
-                        Log.alert("[TokenProtector] ⚠ OS LEAK! Process args contain --accessToken");
-                    }
-                });
+                var processInfo = ProcessHandle.current().info();
+                var cmdLine = processInfo.commandLine();
+                var arguments = processInfo.arguments();
+                processScanIncomplete = cmdLine.isEmpty() || arguments.isEmpty();
+
+                // Classify the launch arguments. A lone standard --accessToken
+                // is the expected launcher form (OS-level exposure no mod can
+                // retract) and is reported as informational, not as an
+                // unexpected credential copy.
+                LaunchSecretScanner.Scan scan = arguments
+                        .map(a -> LaunchSecretScanner.scan(a, "process arguments"))
+                        .or(() -> cmdLine.map(LaunchSecretScanner::scan))
+                        .orElse(null);
+
+                if (scan != null && scan.unexpectedSecret()) {
+                    found.incrementAndGet();
+                    SessionAccessMonitor.recordOsLeak("process:args", "unexpected credential copy; reader unknown");
+                    Log.alert("[TokenProtector] Process arguments contain an unexpected credential copy ({}); validity unverified; reader unknown.", scan.detail());
+                } else if (scan != null && scan.standardAccessTokenArgs() > 0) {
+                    Log.info("[TokenProtector] Standard Minecraft launch arguments include --accessToken at the OS process level (normal launcher exposure; validity unverified; reader unknown). This is informational, not an unexpected copy; a Fabric mod cannot retract OS-visible process arguments.");
+                }
+
+                if (processScanIncomplete) {
+                    Log.alert("[TokenProtector] Process argument scan incomplete: commandLine available={}, arguments available={}. Unavailable data cannot be checked.",
+                            cmdLine.isPresent(), arguments.isPresent());
+                }
             } catch (Exception e) {
-                Log.warn("[TokenProtector] process arg scan failed: {}", e.getMessage());
+                processScanIncomplete = true;
+                Log.alert("[TokenProtector] Process argument scan unavailable: {}", e.getClass().getSimpleName());
             }
         }
 
         int total = found.get();
         if (total > 0) {
             Log.alert(
-                    "[TokenProtector] ⚠ {} OS-level token leak(s) detected! Your launcher exposes your token.",
+                    "[TokenProtector] {} possible credential exposure(s) found in environment, properties, or process arguments; validity and reader unknown.",
                     total);
             AlertManager.triggerOsLeakAlert(
                     "Environment / System",
-                    total + " token leak(s) found (env var, sysprop, or process args)");
+                    total + " possible credential exposure(s); validity and reader unknown");
         } else {
-            Log.info("[TokenProtector] OS leak scan complete: no token leaks found.");
+            Log.info("[TokenProtector] No possible credentials found in inspected sources. Process argument inspection: {}.",
+                    !cfg.monitorProcessArgs ? "disabled" : processScanIncomplete ? "incomplete" : "available");
         }
     }
 

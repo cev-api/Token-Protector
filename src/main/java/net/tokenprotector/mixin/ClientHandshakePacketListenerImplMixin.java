@@ -14,7 +14,7 @@ import java.util.UUID;
  * Keeps multiplayer login working without relying on public User getters to
  * return sensitive data to arbitrary callers.
  */
-@Mixin(ClientHandshakePacketListenerImpl.class)
+@Mixin(value = ClientHandshakePacketListenerImpl.class, priority = 100000)
 public class ClientHandshakePacketListenerImplMixin {
 
     @Redirect(

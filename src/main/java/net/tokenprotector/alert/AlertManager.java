@@ -164,16 +164,16 @@ public final class AlertManager {
             try {
                 SystemToast.add(MinecraftCompat.getToastManager(client),
                         SystemToast.SystemToastId.PERIODIC_NOTIFICATION,
-                        Component.literal("§e⚠ OS Token Leak Detected!"),
-                        Component.literal("§6" + leakSource + " §7(cannot block OS calls)")
+                        Component.literal("§e⚠ Possible Credential Exposure"),
+                        Component.literal("§6" + leakSource + " §7(reader unknown)")
                 );
             } catch (Exception ignored) {}
         }
         if (client.player != null) {
             try {
                 sendPlayerMessage(
-                        Component.literal("§e[TokenProtector] §6⚠ Detected §etoken exposed at OS level (§4"
-                                + leakSource + "§e). §7Your launcher is leaking your token.")
+                        Component.literal("§e[TokenProtector] §6⚠ Possible credential exposure (§4"
+                                + leakSource + "§e). §7" + details)
                 );
             } catch (Exception ignored) {}
         }

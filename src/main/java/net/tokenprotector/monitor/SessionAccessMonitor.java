@@ -20,6 +20,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 public final class SessionAccessMonitor {
+    private static final StackWalker WALKER = StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE);
     private static final int MAX_RECENT_DETECTIONS = 50;
     private static final Deque<Detection> RECENT_DETECTIONS = new ArrayDeque<>();
     private static final Deque<AlertLine> RECENT_ALERTS = new ArrayDeque<>();
@@ -33,7 +34,8 @@ public final class SessionAccessMonitor {
     public static AccessInfo detectCaller() {
         boolean seenOurCode = false;
 
-        for (StackTraceElement element : Thread.currentThread().getStackTrace()) {
+        for (StackWalker.StackFrame frame : WALKER.walk(stream -> stream.toList())) {
+            StackTraceElement element = frame.toStackTraceElement();
             String className = element.getClassName();
 
             if (className.startsWith("net.tokenprotector.")) {
@@ -49,7 +51,7 @@ public final class SessionAccessMonitor {
             // rather than the mixin class. We detect these by looking for the
             // Mixin handler method name pattern: handler$<priority>$<config>$<method>
             if (isInfrastructure(className)) {
-                AccessInfo mixinCaller = detectInjectedMixinCaller(element);
+                AccessInfo mixinCaller = detectInjectedMixinCaller(element, frame.getDeclaringClass());
                 if (mixinCaller != null) return mixinCaller;
                 continue;
             }
@@ -72,67 +74,47 @@ public final class SessionAccessMonitor {
      * Checks whether a stack frame that looks like infrastructure is actually
      * an external mod's Mixin @Inject / @ModifyArg / @Redirect callback.
      * Mixin injects callback methods directly into the target class, so the
-     * class name is the target (net.minecraft.*) but the method name follows
-     * the pattern {@code handler$<priority>$<mixinConfig>$<callbackName>} or
-     * similar.
+     * class name is the target (net.minecraft.*). MixinMerged metadata names
+     * the original mixin; generated handler-name segments are not mod IDs.
      */
-    private static AccessInfo detectInjectedMixinCaller(StackTraceElement element) {
+    private static AccessInfo detectInjectedMixinCaller(StackTraceElement element, Class<?> target) {
         String methodName = element.getMethodName();
-        // Mixin handler patterns: handler$<digits>$<config>$<rest>
-        // Also: various redirect/ModifyArg prefixes like
-        //   tokenprotector$redirectPrepareRequestHeader$...
-        int firstDollar = methodName.indexOf('$');
-        if (firstDollar < 0) return null;
-
-        // Skip Java synthetic methods: lambdas (lambda$...), inner-class accessors
-        // (access$...), and generated forwarders that start with $
-        String prefix = methodName.substring(0, firstDollar);
-        if (firstDollar == 0 || prefix.equals("lambda") || prefix.equals("access")) {
-            return null;
-        }
-
-        int secondDollar = methodName.indexOf('$', firstDollar + 1);
-        if (secondDollar < 0) return null;
-
-        int thirdDollar = methodName.indexOf('$', secondDollar + 1);
-        String configName;
-        if (thirdDollar > 0) {
-            // Three-or-more segments: prefix$priorityOrNull$config$rest
-            configName = methodName.substring(secondDollar + 1, thirdDollar);
-        } else {
-            // Two segments only: prefix$config - e.g. redirect/modify-arg callbacks
-            configName = methodName.substring(secondDollar + 1);
-        }
-
-        if (configName.isEmpty() || "tokenprotector".equals(configName)) return null;
-
-        // Map the mixin config name to a Fabric mod
-        for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
-            String modId = container.getMetadata().getId();
-            // Mixin config names often match the mod id, possibly with dashes/underscores
-            if (configName.equalsIgnoreCase(modId)
-                    || configName.replace("-", "").replace("_", "")
-                            .equalsIgnoreCase(modId.replace("-", "").replace("_", ""))) {
-                return new AccessInfo(
-                        element.getClassName(),
-                        element.getMethodName(),
-                        element.getLineNumber(),
-                        container.getMetadata().getName() + " (" + modId + ")",
-                        modId,
-                        true
-                );
+        try {
+            String owner = null;
+            for (var method : target.getDeclaredMethods()) {
+                if (!method.getName().equals(methodName)) continue;
+                var merged = method.getAnnotation(org.spongepowered.asm.mixin.transformer.meta.MixinMerged.class);
+                if (merged == null) continue;
+                if (owner != null && !owner.equals(merged.mixin())) {
+                    return new AccessInfo(element.getClassName(), methodName, element.getLineNumber(),
+                            "Unknown Mod (ambiguous mixin owner)", null, true);
+                }
+                owner = merged.mixin();
             }
+            if (owner != null) {
+                if (owner.startsWith("net.tokenprotector.mixin.")) return null;
+                ModIdentity mod = identifyMod(owner);
+                return new AccessInfo(owner, methodName, element.getLineNumber(),
+                        mod.displayName(), mod.modId(), true);
+            }
+        } catch (RuntimeException | LinkageError ignored) {
+            // Metadata is best effort; never grant trust based on a guessed mod id.
         }
 
-        // Config name didn't match any mod - still an external caller, just unknown
-        return new AccessInfo(
-                element.getClassName(),
-                element.getMethodName(),
-                element.getLineNumber(),
-                "Unknown Mod [" + configName + "]",
-                null,
-                true
-        );
+        int dollar = methodName.indexOf('$');
+        if (dollar <= 0 || methodName.startsWith("lambda$") || methodName.startsWith("access$")) return null;
+        return new AccessInfo(element.getClassName(), methodName, element.getLineNumber(),
+                "Unknown Mod (injected callback)", null, true);
+    }
+
+    /**
+     * Builds an {@link AccessInfo} for a frame that is neither TokenProtector
+     * code nor a platform class, performing best-effort mod identification.
+     * Used when the internal secret holder detects a direct foreign call.
+     */
+    public static AccessInfo foreignAccessInfo(String className, String methodName) {
+        ModIdentity mod = identifyMod(className);
+        return new AccessInfo(className, methodName, -1, mod.displayName(), mod.modId(), true);
     }
 
     public static void recordBlockedAccess(AccessInfo info, String field) {
@@ -153,12 +135,11 @@ public final class SessionAccessMonitor {
         );
     }
 
-    public static void recordAlertLine(String line) {
+    public static void recordLine(String level, String line) {
         synchronized (RECENT_ALERTS) {
-            RECENT_ALERTS.addFirst(new AlertLine(Instant.now(), line));
-            unreadAlerts++;
-            while (RECENT_ALERTS.size() > 200) {
-                RECENT_ALERTS.removeLast();
+            RECENT_ALERTS.addFirst(new AlertLine(Instant.now(), level, line));
+            if ("ALERT".equals(level)) {
+                unreadAlerts++;
             }
         }
     }
@@ -313,7 +294,7 @@ public final class SessionAccessMonitor {
     ) {}
 
     public record Detection(Instant timestamp, String field, AccessInfo caller, String summary) {}
-    public record AlertLine(Instant timestamp, String message) {}
+    public record AlertLine(Instant timestamp, String level, String message) {}
 
     private record ModIdentity(String displayName, String modId) {}
 }

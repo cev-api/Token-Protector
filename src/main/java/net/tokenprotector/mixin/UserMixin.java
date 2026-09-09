@@ -15,6 +15,7 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
@@ -22,7 +23,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
-@Mixin(User.class)
+@Mixin(value = User.class, priority = 100000)
 public class UserMixin {
 
     @Shadow @Final @Mutable private String accessToken;
@@ -30,6 +31,36 @@ public class UserMixin {
     @Shadow @Final @Mutable private UUID uuid;
     @Shadow @Final @Mutable private Optional<String> xuid;
     @Shadow @Final @Mutable private Optional<String> clientId;
+    @Unique private String tokenprotector$fakeAccessToken;
+
+    /**
+     * Runs at constructor entry, before ordinary constructor-HEAD injections.
+     * This covers runtime account switches (for example an alt manager) as
+     * well as the initial launcher-created User.
+    */
+    @ModifyVariable(
+            // Keep this selector descriptor-free: 26.x runtime mappings do
+            // not retain the compiled constructor descriptor for mixin lookup.
+            method = "<init>",
+            at = @At("HEAD"),
+            // Prepare/inject the variable rewrite before ordinary callback
+            // injectors (order 1000); mixin priority alone is insufficient.
+            order = 900,
+            argsOnly = true,
+            // JVM locals: this=0, name=1, UUID=2, accessToken=3.
+            index = 3
+    )
+    private static String captureAndPoisonAccessTokenArgument(String realAccessToken) {
+        if (!Config.get().blockAccessToken) {
+            return realAccessToken;
+        }
+
+        TokenAccess.captureFromUserConstructor(realAccessToken);
+        String replacement = Config.get().getReplacement("accessToken", "", TokenFaker.fakeAccessToken());
+        TokenAccess.registerReplacement(replacement);
+        Log.info("[TokenProtector] Sanitized access-token constructor argument before User callbacks.");
+        return replacement;
+    }
 
     @Inject(method = "<init>", at = @At("RETURN"))
     private void onConstruct(String name, UUID profileId, String accessToken, Optional<String> xuid, Optional<String> clientId, CallbackInfo ci) {
@@ -39,13 +70,13 @@ public class UserMixin {
         // Capture a trusted alt-account token when one constructs its own User.
         if (!shouldProtect(caller, "accessToken") && caller.externalCaller()
                 && this.accessToken != null && !this.accessToken.isEmpty()) {
-            TokenAccess.capture(this.accessToken);
+            TokenAccess.captureFromUserConstructor(this.accessToken);
         }
         TokenVault.store(self, name, profileId, xuid, clientId);
 
         int blockedCount = 0;
         if (Config.get().blockAccessToken && shouldProtect(caller, "accessToken")) {
-            this.accessToken = Config.get().getReplacement("accessToken", accessToken, TokenFaker.fakeAccessToken());
+            this.accessToken = tokenprotector$replacementAccessToken(accessToken);
             blockedCount++;
         }
         if (Config.get().blockProfileId && shouldProtect(caller, "profileId")) {
@@ -84,7 +115,7 @@ public class UserMixin {
             return;
         }
 
-        String replacement = Config.get().getReplacement("accessToken", real, TokenFaker.fakeAccessToken());
+        String replacement = tokenprotector$replacementAccessToken(real);
         if (Objects.equals(real, replacement)) {
             cir.setReturnValue(real);
             return;
@@ -179,6 +210,17 @@ public class UserMixin {
 
         cir.setReturnValue(replacement);
         blocked(info, "Name");
+    }
+
+    @Unique
+    private String tokenprotector$replacementAccessToken(String real) {
+        // Reuse this User's fake so repeated getters do not grow the registry.
+        if (tokenprotector$fakeAccessToken == null) {
+            tokenprotector$fakeAccessToken = TokenFaker.fakeAccessToken();
+        }
+        String replacement = Config.get().getReplacement("accessToken", real, tokenprotector$fakeAccessToken);
+        TokenAccess.registerReplacement(replacement);
+        return replacement;
     }
 
     @Unique

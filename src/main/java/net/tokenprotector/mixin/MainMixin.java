@@ -1,35 +1,20 @@
 package net.tokenprotector.mixin;
 
-import net.tokenprotector.config.Config;
-import net.tokenprotector.fake.TokenFaker;
-import net.tokenprotector.internal.TokenAccess;
+import net.tokenprotector.internal.LaunchArgumentProtector;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.ModifyArg;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Captures the real access token and poisons the User constructor argument
- * before any constructor-head mixin can observe the real JWT.
+ * Captures the real access token and poisons it before Minecraft starts using
+ * the launch arguments or constructs User.
  */
-@Mixin(net.minecraft.client.main.Main.class)
+@Mixin(value = net.minecraft.client.main.Main.class, priority = 100000)
 public class MainMixin {
 
-    private static String fakeAccessToken() {
-        return Config.get().getReplacement("accessToken", "", TokenFaker.fakeAccessToken());
-    }
-
-    @ModifyArg(
-            method = "main",
-            at = @At(
-                    value = "INVOKE",
-                    target = "Lnet/minecraft/client/User;<init>"
-                            + "(Ljava/lang/String;Ljava/util/UUID;Ljava/lang/String;"
-                            + "Ljava/util/Optional;Ljava/util/Optional;)V"
-            ),
-            index = 2
-    )
-    private static String stashAndPoisonUserArg(String realAccessToken) {
-        TokenAccess.capture(realAccessToken);
-        return fakeAccessToken();
+    @Inject(method = "main", at = @At("HEAD"))
+    private static void captureAndSanitizeLaunchArguments(String[] args, CallbackInfo ci) {
+        LaunchArgumentProtector.captureAndSanitize(args);
     }
 }

@@ -15,7 +15,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /** Authlib 7.x implementation used by Minecraft 1.21.x. */
-@Mixin(MinecraftClient.class)
+@Mixin(value = MinecraftClient.class, priority = 100000)
 public class AuthlibMinecraftClientMixin {
     @Shadow @Final @Mutable private String accessToken;
 

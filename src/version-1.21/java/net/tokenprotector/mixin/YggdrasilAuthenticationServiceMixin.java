@@ -9,7 +9,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 
 /** Authlib 7.0.x used by Minecraft 1.21.x has no FriendsService factory. */
-@Mixin(YggdrasilAuthenticationService.class)
+@Mixin(value = YggdrasilAuthenticationService.class, priority = 100000)
 public class YggdrasilAuthenticationServiceMixin {
 
     private static String fakeAuthToken() {

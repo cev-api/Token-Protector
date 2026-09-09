@@ -2,321 +2,685 @@
 
 ## Overview
 
-This document explains TokenProtector's hardening of common Minecraft session-token read paths, the different types of token reads, why there are many attack vectors, and why a Fabric mod cannot create a security boundary against hostile code in the same JVM or OS-level attacks.
+TokenProtector is a Fabric client mod that reduces Minecraft access-token exposure to other mods.
 
----
+The mod replaces exposed token values across common Minecraft, Fabric Loader, and authlib paths. It also reports suspicious access and competing instrumentation when it can identify them.
 
-## Defense layers
+The design protects the data itself. It does not rely only on method names, field names, or known malware signatures.
 
-TokenProtector uses multiple overlapping layers to reduce exposure on its covered paths. No Fabric mod can ensure that a hostile peer mod cannot bypass, cancel, or target those layers.
+Normal Minecraft authentication continues to work because TokenProtector keeps the real access token only for the narrow authentication path that needs it.
 
-### 1. Bootstrap interception (MainMixin)
+TokenProtector is designed as practical hardening against malicious or compromised mods. It does not claim to create full process isolation between hostile code that shares the same JVM.
 
-`MainMixin` intercepts the `new User(...)` call in `Main.main()` via `@ModifyArg`. At this covered boundary, the real JWT is captured in an internal authentication helper and a fake token is substituted as the `accessToken` constructor argument. The tested constructor-time probes see a fake. Code that runs earlier or interferes with mixin transformation/order is outside this guarantee.
+## Security goal and threat model
 
-### 2. Field poisoning (UserMixin)
+TokenProtector assumes that another Fabric mod can use normal and advanced same-JVM techniques, including:
 
-`UserMixin` fires at `@At("RETURN")` of the `User` constructor. It reads the internal authentication helper as the source of truth and stores non-token session values in `TokenVault`. Then it overwrites every visible `User` field (`accessToken`, `uuid`, `xuid`, `clientId`, `name`) with configurable fake replacements.
+- public Minecraft APIs,
+- direct field access,
+- reflection,
+- `Unsafe`,
+- `VarHandle`,
+- `MethodHandle`,
+- `LambdaMetaFactory`,
+- generated accessors,
+- encoded or obfuscated names,
+- Fabric Loader APIs,
+- Mixin injection,
+- maximum Mixin priority,
+- classloader access,
+- authlib internals,
+- authlib HTTP hooks,
+- concurrent polling,
+- Fabric `preLaunch` entrypoints,
+- dynamic Java-agent self-attach,
+- bytecode instrumentation.
 
-All public getters (`getAccessToken()`, `getSessionId()`, etc.) are also intercepted and return fake values to unauthorized callers.
+TokenProtector also treats launcher, operating-system, native, and filesystem credential copies as a separate trust boundary.
 
-### 3. Authlib protection
+The security goal is:
 
-`com.mojang.authlib.minecraft.client.MinecraftClient.accessToken` is kept fake at rest. Version-specific hooks cover the supported authlib methods (`get`, `postInternal`, or `prepareRequest` depending on authlib). The regression probes see the fake value; this does not cover every possible network or egress hook.
+1. Keep common game-visible and authlib token state on replacement values.
+2. Remove the real token from Fabric's retained in-JVM launch arguments before normal game startup.
+3. Give the real token only to the authentication path that requires it.
+4. Report blocked or suspicious activity when attribution is possible.
+5. State the remaining same-JVM and external limits clearly.
 
-The real token is reintroduced only through narrow protected call-site redirects at the exact Mojang auth paths that need it (join server, refresh, etc.). It is never restored into the public authlib field for normal request building.
+## Protection architecture
 
-### 4. Spin-race protection
+### Pre-launch argument protection
 
-Because `MinecraftClient.accessToken` stays fake at rest, polling that field at high speed with `Unsafe` only returns the fake value. The traditional "read one field 20 million times per second" spin-race does not work - there is no window where the real token briefly appears in that field.
+TokenProtector registers a Fabric `preLaunch` entrypoint.
 
-The included connection-level spin-race probe did not observe an `Authorization` header in the inspected `URLConnection.requests` map. That result is specific to the tested path; it does not establish that every header, socket, or third-party network hook is covered.
+Fabric keeps parsed launch arguments in the Minecraft game provider. After Fabric finishes the `preLaunch` entrypoints, the provider builds the argument array for `Main.main(String[])` from this retained `Arguments` object with `arguments.toArray()`.
 
-A targeted mod can still attempt bytecode interception of the redirected auth path, an earlier hook, mixin cancellation/priority changes, a JVM agent, or an alternative credential source.
+TokenProtector uses its pre-launch handler to:
 
-### 5. Side-channel and polling detection
+- capture the real `--accessToken` for the protected authentication path,
+- create and register the replacement token,
+- replace the retained `accessToken`,
+- replace equals-form copies,
+- replace matching copies in extra arguments and wrapper payloads,
+- preserve the argument shape.
 
-TokenProtector tracks suspicious behavior patterns:
+This produces an important result:
 
-- rapid authlib token polling,
-- repeated unsafe field reads,
-- legacy/unmapped token probes,
-- launcher/OS token exposure.
+```text
+launcher credential
+      |
+      v
+Fabric retained Arguments
+      |
+      | TokenProtector preLaunch capture + scrub
+      v
+replacement value
+      |
+      +--> FabricLoader.getLaunchArguments(false)
+      |
+      +--> Main.main(String[])
+      |
+      +--> normal Minecraft startup
+```
 
----
+The real token does not need to appear in the later `Main.main` argument array.
 
-### Real auth still works
+This design also protects against the tested dynamic-agent attack at `Main.main` entry. The adversarial TokenReader agent installs during `preLaunch` and registers bytecode advice for `Main.main`. The transformer is active when `Main` loads, but Fabric creates `Main.main`'s array from the retained arguments only after all `preLaunch` entrypoints finish. TokenProtector therefore has an opportunity to scrub the retained data before the agent can observe the method argument.
 
-Multiplayer login, skins, capes, and Realms all function because the real token is delivered to Mojang's auth endpoints through the narrow protected redirects - not through the normal public getters or fields that mods can read.
+On the tested run, the first bytecode of `Main.main` receives:
 
----
+```text
+accessToken = FAKE_TOKEN_LOL
+```
 
-## Types of token reads
+This result is structural for this specific `Main.main`-entry attack. It does not depend on TokenProtector winning Mixin priority against TokenReader.
 
-The token reader tests every meaningful category of access.
+Code that directly copies the retained arguments before TokenProtector's own `preLaunch` handler runs remains outside this boundary.
 
-### 1. Public API reads
+### `Main.main` fallback
 
-These are the simplest and most common attacks.
+TokenProtector also protects `Main.main(...)` at HEAD.
 
-- `User.getAccessToken()`
-- `User.getSessionId()`
-- `User.getProfileId()`
-- `User.getXuid()`
-- `User.getClientId()`
+This is a fallback for an environment where the pre-launch path does not run as expected or the delivered argument array still contains an unregistered real token.
 
-If these are blocked, the first line of defense is working.
+If the array already contains a TokenProtector-issued replacement, the fallback does not replace the stored real authentication credential with the fake value.
 
-### 2. Direct field access
+### Fabric Loader retained arguments
 
-Modders can bypass getters by reading fields directly.
+Fabric Loader exposes launch arguments through:
 
-- `Field.get(user, "accessToken")`
-- `Field.get(user, "uuid")`
-- `Field.get(user, "xuid")`
+```java
+FabricLoader.getInstance().getLaunchArguments(boolean sanitize)
+```
 
-This proves protection must poison the underlying field itself, not just the getter.
+TokenProtector protects the retained data itself.
 
-### 3. Legacy class access
+On the tested path:
 
-Many stealers are written for old Minecraft versions.
+```text
+FabricLoader.getLaunchArguments(false)
+    accessToken = FAKE_TOKEN_LOL
 
-They look for classes like:
+FabricLoader.getLaunchArguments(true)
+    accessToken option omitted
+```
 
-- `client.session.Session`
-- `client.util.Session`
-- `util.Session`
-- `class_320`
+### `User` constructor protection
 
-These are thrown at the JVM because a mod can still load old code paths or use old assumptions. If the protection only covers current names, it is incomplete.
+`UserMixin` rewrites the access-token constructor parameter with `@ModifyVariable`.
 
-### 4. Legacy field access
+The rewrite uses injector order 900.
 
-Even if the class exists, field names may differ.
+Ordinary callback injectors use order 1000. This lets TokenProtector replace the token before an ordinary callback at the constructor HEAD receives it.
 
-Older mods or leaked code may try fields such as:
+The adversarial TokenReader also places its constructor Mixin at the Mixin priority ceiling, `Integer.MAX_VALUE`.
 
-- `field_1983`
-- `field_1982`
-- `field_34960`
-- `field_148258_c`
+The tested constructor still receives:
 
-The harness checks those too.
+```text
+User.<init> HEAD accessToken = FAKE_TOKEN_LOL
+Is JWT (real token)? No
+```
 
-### 5. Singleton and client path probes
+This matters because a higher Mixin priority does not automatically defeat the constructor rewrite. Injector order and the final woven bytecode determine the observed value.
 
-A mod can try to reach the token through the Minecraft instance:
+An attacker can still try a different injector order or a different transformation mechanism.
 
-- `MinecraftClient.getInstance().getUser()`
-- `MinecraftClient.getInstance().session`
-- `MinecraftClient.getInstance().field_1726`
+The same protection applies when runtime account switching creates another `User`.
 
-These paths are especially important because they are often the first thing a malicious mod tries.
+### Stored `User` values
 
-### 6. Obfuscated access techniques
+Protected `User` state contains replacement values.
 
-Token stealers can hide the real names, so the protector must not rely on string matching.
+Depending on configuration, TokenProtector can replace:
 
-The probe suite tests:
+- access token,
+- session ID,
+- profile UUID,
+- XUID,
+- client ID,
+- player name.
 
-- XOR-encoded class/method names
-- Base64-encoded identifiers
-- Caesar-shifted strings
-- split/reassembled identifiers
-- names built from raw int arrays
-- dynamic `MethodHandle` lookups
-- `LambdaMetaFactory` generated accessors
+The access-token field itself contains the replacement.
 
-Why so many? Because real malware does not use plain strings. It reconstructs identifiers at runtime to evade detection.
+This means a reader that uses reflection, `Unsafe`, `VarHandle`, `MethodHandle`, an encoded field name, or a generated accessor still reads the value stored in that field. Changing the access technique does not reconstruct the original credential.
 
-### 7. Authlib internal chain
+### Getter protection and caller attribution
 
-The true hard target is authlib's internal token storage.
+TokenProtector intercepts protected caller-aware getters such as:
 
-That chain includes:
+- `User.getAccessToken()`,
+- `User.getSessionId()`,
+- `User.getProfileId()`,
+- `User.getXuid()`,
+- `User.getClientId()`,
+- `User.getName()`.
 
-- private fields on `Minecraft` and authlib objects
-- the `YggdrasilUserApiService` implementation
-- `MinecraftClient.accessToken`
+When possible, TokenProtector identifies the caller with stack information, mod ownership, and Mixin metadata.
 
-A protection mod must verify that even these internal objects do not leak the real token to mods.
+A blocked event can include:
 
-### 8. Constructor-time capture
+- mod ID,
+- class,
+- method,
+- source line,
+- protected field.
 
-The token reader hooks key lifecycle moments where a stealer is most likely to read a token:
+Caller attribution is best effort.
 
-- when the client starts connecting to a server,
-- when the handshake begins,
-- when `MinecraftClient` is constructed.
+A direct field read or low-level memory read can avoid a getter hook. TokenProtector therefore treats replacement of the underlying data and attribution of a read as separate protections.
 
-The covered bootstrap boundary substitutes a fake token for `User` construction; the internal helper remains the source for redirected authentication calls. The tested constructor-time probes see a fake, but an earlier observer or mod that interferes with mixin transformation/order is not ruled out. If you whitelist a mod that performs its own `User` construction (e.g. an alt-account manager), that mod is explicitly trusted and may receive real values through the allowed path - TokenProtector cannot prevent a trusted mod from exposing what it has been allowed to access.
+### Internal authentication helper
 
-### 9. Concurrent time-window attack (spin-race)
+TokenProtector keeps the real token in an internal helper because Minecraft still needs a valid credential for authentication.
 
-This probe polls `MinecraftClient.accessToken` at extreme speed during server join, hoping to catch the real JWT in a brief window where authlib temporarily holds it. This does not succeed against TokenProtector because `MinecraftClient.accessToken` stays fake at rest - the real token is never written into that public field. Polling it at any speed only returns the fake value.
+The helper does not act as an unrestricted public token getter.
 
-### 9.5. Post-call connection probes
+Sensitive reads and mutations check the effective calling context. The gate unwraps common reflection and method-handle frames and can use Mixin metadata to distinguish TokenProtector handlers from foreign merged handlers.
 
-These probes hook authlib's `getWithEtag`/`postWithEtag` at `RETURN` - after the full HTTP cycle completes - and inspect the `URLConnection` object:
+Covered foreign calls are denied.
 
-- `connection.getRequestProperty("Authorization")` - checks if the header was set during the connect/read phase
-- Unsafe access to `URLConnection.requests` (the internal `MessageHeader` map) - may be materialized post-call
-- `URLConnection.connected` - confirms the socket was established
+Examples include:
 
-These probes inspect the connection object after the HTTP cycle. The tested probe did not observe the real token or an `Authorization` header in that map. This is a result for that inspected path, not a claim that every connection or socket layer is covered.
+- direct foreign `forAuthentication()` calls,
+- reflective foreign calls,
+- method-handle foreign calls,
+- foreign attempts to replace the stored credential,
+- foreign attempts to add replacement values,
+- covered foreign Mixin handlers.
 
-### 9.6. Connection spin-race (materialization-tolerant)
+This gate blocks a simple direct API route to the retained token.
 
-Unlike the authlib field race, this probe targets the `URLConnection` object directly. It spins on `Unsafe.getObject(connection, requestsOffset)` in a tight loop for up to 10 seconds, waiting for the internal `MessageHeader` map to materialize (pop from null to an actual object) mid-connection. Once materialized, it switches to the fast Unsafe -> `MessageHeader` path and races on header inspection.
+The token is also not stored as a plaintext `String`. It is kept masked against a per-capture random pad inside a single opaque record field, so a `getDeclaredField("accessToken")`-style read finds no such field and a blind scan for JWT-shaped static String fields finds nothing. The plaintext is materialised only inside the gated read method itself, immediately before it is handed to an authentication call.
 
-This tested spin-race did not observe an `Authorization` header in the inspected map. It does not establish that a different connection implementation, socket hook, or egress path is protected.
+The gate is deliberately not funnelled through one helper method. `forAuthentication()` performs its own inline call-context check, so a hostile agent that retransforms a single shared gate method (for example the former `authorized()` helper) cannot silently open the read path; it would have to rewrite `forAuthentication()` itself.
 
-### 10. OS-level process probing
+It is not a memory-isolation boundary. A Java agent that retransforms TokenProtector's own methods can still rewrite `forAuthentication()`, neutralise `platformMethodAuthorized(...)`, or decode the masked pair - an agent is allowed to rewrite the defending code, and no Fabric mod can prevent that. Without an agent, a hostile mod can still attempt `Unsafe`, reflection against the (masked) backing state, bytecode transformation through another loader tier, or execution inside a trusted-looking platform context, but it no longer finds a plaintext token field or a single gate method to neutralise.
 
-These are not protections; they are leak detectors.
+### Authlib protection
 
-They search:
+TokenProtector keeps `com.mojang.authlib.minecraft.client.MinecraftClient.accessToken` on a replacement value at rest on the covered paths.
 
-- `ProcessHandle.info().commandLine()`
-- `RuntimeMXBean.getInputArguments()`
-- system properties containing `token`, `access`, `session`, or `auth`
-- environment variables like `TOKEN`, `ACCESS`, `MINECRAFT`, `MOJANG`
-- `sun.java.command`
+Version-specific hooks supply the real credential only where the supported authlib flow needs it.
 
-These methods show why the launcher or OS can leak tokens even if the JVM is locked down.
+The adversarial TokenReader tests authlib through:
 
----
+- `get`,
+- `getWithEtag`,
+- `post`,
+- `postWithEtag`,
+- `prepareRequest`,
+- `postInternal` where present,
+- `createUrlConnection`,
+- returned `HttpURLConnection` objects,
+- internal request-header storage,
+- reflection and `Unsafe` through `Minecraft.userApiService`.
 
-## Why there are so many probes
+The tested authlib object state stays on `FAKE_TOKEN_LOL`.
 
-Because there are many distinct ways to reach the same secret.
+The tested returned connection objects do not expose an `Authorization` value through the TokenReader probes.
 
-### Different abstraction levels
+This is not a general network sandbox. Native interception, another HTTP stack, TLS instrumentation, or a different final authentication hook can still operate outside these tested Java paths.
 
-A token can be read at any of these levels:
+## Detection and posture checks
 
-- clean API calls (`User.getAccessToken()`)
-- private field reads (`Field.get(...)`)
-- unsafe memory access (`Unsafe`, `VarHandle`)
-- generated call sites (`MethodHandle`, `LambdaMetaFactory`)
-- obfuscated runtime string assembly
-- legacy class names and fields
-- authlib internals
-- operating system process metadata
+### Mixin posture
 
-Each of those is a separate attack surface.
+TokenProtector uses high-priority security Mixins on its protected targets.
 
-### Different attacker assumptions
+The configured security priority is `100000`.
 
-A stealer can be:
+TokenProtector inspects protected classes for foreign merged Mixin handlers.
 
-- a naive mod using public getters,
-- a complex mod using reflection,
-- a legacy mod using old class names,
-- an obfuscated mod trying to evade detection,
-- a side-channel attacker timing the authlib window,
-- a launcher or OS process reading the token before the JVM starts.
+A foreign merge at or above TokenProtector's security priority produces an alert. Lower-priority merges can be reported as informational data.
 
-A protection app cannot ignore any of those assumptions.
+This detects some attempts to compete with TokenProtector. It does not turn Mixin priority into an enforcement boundary.
 
-### Easy to obfuscate means easy to hide from heuristics
+A separate Mixin configuration does not provide a general mechanism that can simply delete every other mod's Mixin. A hostile mod can still use different injection points, different injector orders, cancellable handlers where applicable, another transformer, or a Java agent.
 
-Most mod-based token stealers rely on the same underlying read operation: read a String field from a game object.
+### Java-agent and instrumentation posture
 
-What changes is only how the code refers to that field.
+TokenProtector checks for signs of more privileged in-JVM instrumentation during its `preLaunch` phase and again on the first client tick.
 
-That is why obfuscation is cheap:
+The checks include:
 
-- build the class name at runtime
-- decode the method name from bytes
-- use `MethodHandle` instead of a direct call
-- use `LambdaMetaFactory` to create a function object
+- mods that declare Fabric `preLaunch` entrypoints,
+- known agent tooling on the classpath, such as Byte Buddy agent resources,
+- dynamic-attach artifacts,
+- protected classes that are loaded but no longer contain TokenProtector's expected merged handlers.
 
-The actual secret access still follows the same path.
+These checks are detection, not enforcement.
 
-So the defender must protect the data, not just block specific names.
+They do not prove that token theft occurs.
 
----
+They also cannot detect every form of instrumentation. An attacker can use unknown tooling, native code, preserve TokenProtector's handlers during retransformation, or begin from outside Fabric.
 
-## Why obfuscation is easy for stealers
+### External exposure scanner
 
-A stealer does not need to be a full malware product.
+TokenProtector inspects some environment variables, Java system properties, and process metadata for possible credential exposure.
 
-For a Fabric mod, the JVM gives you everything:
+It understands known credential option names and JWT-shaped or long opaque values in unexpected locations.
 
-- runtime reflection
-- module access if you can use `MethodHandles.privateLookupIn`
-- `Unsafe` when a mod can obtain it by reflection
-- the same classloader as the game
-- the same process arguments and environment
+A normal authenticated launch includes an `--accessToken` option. TokenProtector treats one normal access-token argument as expected launch exposure rather than proof of malware.
 
-In this environment, hiding your intent is cheap:
+Warnings are reserved for unexpected conditions such as:
 
-- mod code is still executed by the game,
-- strings can be reconstructed at runtime,
-- any access path can be wrapped in a generated lambda,
-- the JVM does not prevent you from calling `Field.get()` on private data if you already have the object.
+- duplicate token copies,
+- `--msaToken`,
+- refresh-token options,
+- unknown JWT-shaped arguments,
+- wrapper payloads that contain JWT-shaped values,
+- environment-variable credential exposure,
+- Java system-property credential exposure.
 
-So attackers simply move from "name-based detection" to "behavior-based detection." That is why the protection app is designed around data poisoning and token isolation instead of blocking a fixed list of identifiers.
+If Java cannot expose a requested process source, TokenProtector reports the scan as incomplete.
 
----
+TokenProtector cannot rewrite:
 
-## Why OS-level attacks cannot be blocked by a Fabric mod
+- the native operating-system command line,
+- launcher account files,
+- launcher logs,
+- another process,
+- external credential storage.
 
-A Fabric mod runs inside the Minecraft JVM. That gives it power over Java objects, but not over the process launcher or the operating system.
+### Log history and file logging
 
-### OS-level leaks are outside the JVM boundary
+Every line TokenProtector writes to the console is also kept in two places:
 
-Examples:
+- The Mod Menu "Recent Detections" tab renders the complete in-game history for the current session. The history stores every level (INFO, WARN, ERROR, ALERT), keeps every entry for the session (no 200-entry ring), and renders each line without truncation by wrapping long messages. Only ALERT entries increment the unread counter on the top-right banner; INFO and WARN lines still appear in the history.
+- `tokenprotector.log` in the game directory is a separate on-disk archive that appends across sessions. Each session starts with a header line that records the start time and the Minecraft and Fabric Loader versions. File-write failures are swallowed and never affect the game.
 
-- `--accessToken` on the command line
-- `System.getenv("ACCESS_TOKEN")`
-- `ProcessHandle.info().commandLine()`
-- `launcher_accounts.json` on disk
-- any native launcher API that exposes secrets
+## Adversarial verification with TokenReader
 
-A Fabric mod cannot alter the OS process listing, the environment, or the launcher's behavior after the game starts.
+### Test profile
 
-### What the mod can do
+TokenReader is a separate adversarial test mod that is intentionally designed to get around TokenProtector.
 
-A mod can only:
+It contains more than 100 discrete probe paths across 13 categories.
 
-- detect the leak,
-- warn the user,
-- avoid exposing the same secret again inside the JVM.
+| Category | Attack surface |
+|---|---|
+| A. Direct API access | Public `User` getters |
+| B. Direct field access | Raw `User` fields |
+| C. Legacy class names | Old session and Yarn/MCP names |
+| D. Legacy fields | Old field names and mappings |
+| E. Singleton paths | Minecraft singleton and session-object routes |
+| F. Obfuscated access | XOR, Base64, Caesar, split strings, arrays, `MethodHandle`, `LambdaMetaFactory`, `Unsafe`, `VarHandle`, indirect stack calls |
+| G. Class-sweep discovery | Static-field search, known names, brute-force names, module search |
+| H. Authlib internal chain | `Minecraft.userApiService` to `MinecraftClient.accessToken` through reflection, `Unsafe`, `privateLookupIn`, and object traversal |
+| I. Lifecycle and deep HTTP hooks | Construction, connection, handshake, authlib request methods, returned connections |
+| J. Concurrent races | High-speed field and connection-header polling |
+| K. Auth-service side channels | Authentication-service object discovery and recursive field inspection |
+| L. OS and launcher probing | Process metadata, Java properties, environment, Fabric Loader arguments, parent process tree |
+| M. Java agent | Self-attached Byte Buddy instrumentation at `Main.main` bytecode entry and authlib connection return points |
 
-It cannot stop another process from reading the process command line or environment variables.
+The lifecycle and authlib Mixins use `Integer.MAX_VALUE`, the Mixin priority ceiling.
 
-### Why that matters
+The Java agent self-attaches during Fabric `preLaunch` and instruments the final woven bytecode. Its `Main.main` advice executes before Mixin HEAD handlers.
 
-If the launcher puts the token in an environment variable or command line argument, every process on the machine may be able to read it.
+This test profile is intentionally stronger than a normal token-stealing mod. It attacks the implementation directly rather than only using ordinary Minecraft APIs.
 
-That is a fundamentally different class of attack than a malicious mod.
+### Runtime result summary
 
-A good protection strategy is therefore:
+The adversarial run reports replacement data across the tested in-JVM token surfaces.
 
-- protect the JVM-visible token paths,
-- and still treat launcher/OS leaks as a separate, higher-privilege threat.
+| Probe | Result |
+|---|---|
+| Raw Byte Buddy advice at first bytecode of `Main.main` | `FAKE_TOKEN_LOL` |
+| TokenReader `Main.main` Mixin at `Integer.MAX_VALUE` | `FAKE_TOKEN_LOL` |
+| `User.<init>` HEAD at `Integer.MAX_VALUE` | `FAKE_TOKEN_LOL` |
+| `User.getAccessToken()` | `FAKE_TOKEN_LOL` |
+| `User.accessToken` | `FAKE_TOKEN_LOL` |
+| Encoded and indirect getter paths | `FAKE_TOKEN_LOL` |
+| `Unsafe` read of protected `User.accessToken` | `FAKE_TOKEN_LOL` |
+| Knot classloader to `Minecraft.getUser().getAccessToken()` | `FAKE_TOKEN_LOL` |
+| Authlib `MinecraftClient.accessToken` via `Unsafe` | `FAKE_TOKEN_LOL` |
+| Authlib `MinecraftClient.accessToken` via reflection | `FAKE_TOKEN_LOL` |
+| Authlib `MinecraftClient.accessToken` via `privateLookupIn` | `FAKE_TOKEN_LOL` |
+| Tested authlib method hooks | `FAKE_TOKEN_LOL` |
+| `FabricLoader.getLaunchArguments(false)` | `FAKE_TOKEN_LOL` |
+| `FabricLoader.getLaunchArguments(true)` | Token option omitted |
+| Byte Buddy authlib `HttpURLConnection` return probes | No `Authorization` value observed |
+| Runtime account-switch `User` construction | `FAKE_TOKEN_LOL` |
+| Reflective read of vault field `accessToken` | Field does not exist (credential masked at rest) |
+| Blind scan of static String fields for a JWT | No real token found |
+| Agent retransformation of a shared gate helper | No shared `authorized()` helper exists; the read gate is inline in the accessor |
+| Reflective `forAuthentication()` after gate-kill attempt | `null` (still denied) |
 
----
+No Minecraft access token is observed by these covered in-JVM TokenReader probes.
 
-## Summary
+### Dynamic Java-agent test
 
-TokenProtector hardens Minecraft against common token-stealing techniques through overlapping defensive layers:
+TokenReader installs Byte Buddy before `Main.main` runs.
 
-- **Bootstrap interception** - the real JWT is stashed before any other mod's `User` constructor hook fires; the constructor argument itself is poisoned.
-- **Field and getter poisoning** - every visible `User` field and getter returns fake values to unauthorized callers.
-- **Authlib protection** - `MinecraftClient.accessToken` stays fake at rest; the real token is only reintroduced at the narrow auth endpoints that need it.
-- **Spin-race protection** - polling `MinecraftClient.accessToken` or `URLConnection` headers at any speed returns the fake value because the real token never enters those objects. Connection-level materialization-tolerant races also find no `Authorization` header.
-- **Side-channel detection** - suspicious polling, repeated unsafe reads, and legacy probes are tracked and surfaced.
+Its transformer inserts advice at the first bytecode of `Main.main`. This places TokenReader earlier than every Mixin HEAD handler in that method.
 
-Over 90 probe methods across 11 categories have been tested: public APIs, reflection, legacy names, obfuscation, unsafe memory access, authlib internals, constructor-time reads, post-call connection probes, and connection-level spin-races. With protection enabled and the test mod unwhitelisted, the supported probes returned fake data while multiplayer, skins, and Realms continued to work through protected auth redirects.
+The observed argument is still:
 
-Some attacks are outside the scope of a Fabric mod:
+```text
+accessToken = FAKE_TOKEN_LOL
+```
 
-- command-line leaks,
-- environment variable leaks,
-- launcher-side token storage,
-- and disk-based credential files.
+The same run places TokenReader's normal Mixin at `Integer.MAX_VALUE`. It also sees the replacement.
 
-The recommendation is to combine TokenProtector (JVM layer) with a trusted launcher and OS-level hardening for the process and filesystem layers.
+The reason is the pre-launch retained-argument scrub. Fabric creates `Main.main`'s argument array from the retained `Arguments` after the `preLaunch` phase. TokenProtector replaces the credential in that retained source before the array exists.
+
+This means the tested Java-agent attack cannot recover the launcher token merely by moving to the top of `Main.main`.
+
+This result does not mean all Java agents are harmless. A launcher-supplied `-javaagent`, an earlier `preLaunch` callback that directly reads the retained arguments, or an agent that targets TokenProtector's internal state uses a different attack boundary.
+
+### Mixin-priority and constructor test
+
+TokenReader sets its relevant Mixins and config priority to `2147483647`.
+
+This is the maximum Java `int` value.
+
+The tested `Main.main` and `User` constructor probes still receive the replacement value.
+
+For `Main.main`, the real token is already absent from the delivered argument array.
+
+For the `User` constructor, TokenProtector's `@ModifyVariable` rewrite uses injector order 900, so a simple maximum-priority callback at HEAD does not recover the original token in the tested woven bytecode.
+
+### Obfuscation and indirect-access tests
+
+TokenReader tries to hide what it accesses with:
+
+- XOR-encoded names,
+- Base64-encoded names,
+- Caesar-shifted names,
+- split and reassembled names,
+- integer arrays,
+- indirect array dispatch,
+- anonymous and stack-indirect callers,
+- `MethodHandle`,
+- `LambdaMetaFactory`,
+- reflection,
+- `Unsafe`,
+- `VarHandle`.
+
+These techniques do not reconstruct a token that is no longer stored in the protected field.
+
+The tested paths continue to receive the replacement or fail access.
+
+### Authlib internal-chain tests
+
+TokenReader traverses:
+
+```text
+Minecraft
+  -> userApiService
+  -> YggdrasilUserApiService
+  -> MinecraftClient
+  -> accessToken
+```
+
+It uses `Unsafe`, reflection, `MethodHandles.privateLookupIn`, and field enumeration.
+
+The protected authlib token remains:
+
+```text
+FAKE_TOKEN_LOL
+```
+
+### HTTP and final-call tests
+
+TokenReader hooks the tested authlib request path at multiple levels.
+
+It inspects:
+
+- authlib method entry,
+- `prepareRequest`,
+- `postInternal` where present,
+- `createUrlConnection`,
+- returned `HttpURLConnection` objects,
+- `getRequestProperty("Authorization")`,
+- internal `MessageHeader` request storage through `Unsafe`,
+- post-call returned connections,
+- Byte Buddy advice on authlib methods that return `HttpURLConnection`.
+
+The tested run does not expose an `Authorization` value through these observation points.
+
+Authentication-related Mojang endpoints still return valid data, which shows that normal authenticated functionality continues to work while the exposed authlib state stays replaced.
+
+### Concurrent race tests
+
+TokenReader uses high-speed polling to look for a short interval where the real credential becomes visible.
+
+A 15-second token-field race records:
+
+```text
+Total reads: 543484520
+Duration: 15000 ms
+Baseline: FAKE_TOKEN_LOL
+Final value: FAKE_TOKEN_LOL
+Value changed: no
+```
+
+A separate agent-enabled connection-header race records:
+
+```text
+Total reads: 48771570
+Duration: 10005 ms
+Baseline Authorization: null
+Final Authorization: null
+requests materialized during spin: false
+```
+
+These results show no observable real token in the tested race windows.
+
+### Fabric Loader tests
+
+TokenReader also checks Fabric's own retained argument copies.
+
+The tested unsanitized API returns the replacement:
+
+```text
+FabricLoader.getLaunchArguments(false)
+    accessToken = FAKE_TOKEN_LOL
+```
+
+The tested sanitized API omits the token option.
+
+### OS and launcher probes
+
+TokenReader also checks sources that a Fabric mod cannot fully control:
+
+- `ProcessHandle.info().commandLine()`,
+- `ProcessHandle.info().arguments()`,
+- `RuntimeMXBean`,
+- Java system properties,
+- environment variables,
+- `sun.java.command`,
+- internal process APIs,
+- parent and launcher process metadata.
+
+These tests are useful for finding external copies, but they are not equivalent to a bypass of TokenProtector's in-JVM replacement paths.
+
+In the supplied run, Java does not expose the relevant native command line through `ProcessHandle`, so that source remains unverified by the test.
+
+## Security limits
+
+TokenProtector provides strong practical protection on its covered and tested in-JVM paths.
+
+It does not isolate arbitrary hostile code at the process level.
+
+The real token must still exist inside the Minecraft JVM so the client can authenticate.
+
+A determined attacker can still try to operate at a different privilege or timing boundary, including:
+
+- a launcher-supplied `-javaagent`,
+- a modified JVM,
+- a modified Fabric Loader,
+- a `preLaunch` entrypoint that executes before TokenProtector and directly copies the retained arguments,
+- instrumentation that retransforms TokenProtector's own methods (for example `forAuthentication()` itself) or decodes the masked retained state,
+- direct `Unsafe` or reflective access to TokenProtector's masked backing state,
+- bytecode that executes from a context that TokenProtector treats as trusted,
+- native code,
+- network interception outside the tested Java path,
+- launcher-side credential storage,
+- operating-system process data,
+- filesystem credentials.
+
+The stored credential is masked at rest and the read gate is duplicated, so a name-based field read finds no plaintext token and disabling a single shared gate helper no longer opens the read path. An adaptive reflective or `Unsafe` attacker can still decode the masked pair (masking defeats blind scans, not a determined reader of the class), while retransforming the gated method itself requires Java-agent privilege and remains outside the threat model of ordinary hostile mods.
+
+TokenProtector can detect some of these conditions, but detection does not equal isolation.
+
+A stronger architecture can keep the real credential outside the Minecraft JVM entirely, for example by using a launcher-side authentication broker. TokenProtector does not require a custom launcher and does not provide that architecture.
+
+## Optional JVM hardening
+
+The dynamic self-attach route used by Byte Buddy can also be disabled at JVM startup with:
+
+```text
+-XX:+DisableAttachMechanism
+```
+
+This option disables the JVM Attach mechanism. TokenProtector cannot enable it after Java starts.
+
+It does not stop a launcher-supplied `-javaagent`, native instrumentation, or a modified JVM or loader.
+
+## FAQ
+
+### Can another Fabric mod simply read the access token?
+
+On the covered paths, ordinary getters, direct protected fields, Fabric Loader's retained argument view, and the tested authlib state return replacement data.
+
+TokenReader verifies these paths with direct, reflective, obfuscated, low-level, and instrumented probes.
+
+### Does a higher Mixin priority defeat TokenProtector?
+
+Not by itself.
+
+TokenReader uses `Integer.MAX_VALUE`, the priority ceiling.
+
+Its tested `Main.main` and constructor handlers still receive `FAKE_TOKEN_LOL`.
+
+For `Main.main`, TokenProtector removes the real token from Fabric's retained argument source before the final array exists.
+
+For the constructor, injector order and final woven bytecode matter in addition to Mixin priority.
+
+### Can another Mixin configuration cancel TokenProtector's Mixins?
+
+Mixin configurations for one target are merged into the same class transformation. There is no general "remove every other mod's Mixin" switch in another config.
+
+A hostile mod can still interfere with particular injection points, use different injector orders, use cancellable handlers where possible, or leave the Mixin system and use another transformer or Java agent.
+
+### Can a dynamic Java agent see the real token at `Main.main` entry?
+
+Not on the tested covered path.
+
+The adversarial TokenReader agent self-attaches during `preLaunch` and inserts advice at the first bytecode of `Main.main`.
+
+That advice receives `FAKE_TOKEN_LOL`.
+
+Fabric creates the `Main.main` argument array from its retained arguments after the `preLaunch` phase, and TokenProtector scrubs that retained source first.
+
+A different agent that runs from the launcher, directly reads retained arguments before TokenProtector, or targets TokenProtector's internal secret state uses a different attack boundary.
+
+### Can TokenReader instrument the authlib HTTP path?
+
+Yes.
+
+It hooks the tested authlib request methods and returned connection objects with both Mixin and Byte Buddy instrumentation.
+
+Those probes receive replacement token state or no observable `Authorization` value in the tested run.
+
+This is evidence for the tested Java path, not a claim of general network isolation.
+
+### What if a mod uses `Unsafe`, reflection, `VarHandle`, or `MethodHandle`?
+
+When these techniques target protected game or authlib fields, they read the replacement that is stored in those fields.
+
+They do not reconstruct the original credential.
+
+Against TokenProtector's own retained state, the credential is masked at rest: there is no plaintext static `String` field to read, and the read gate is duplicated so disabling a single shared helper method does not open it. An adaptive attacker must now decode the masked pair (possible with reflection or `Unsafe`, but requiring them to understand the storage rather than read a named field), while removing the gate by retransformation still requires Java-agent privilege. That remains the documented same-JVM boundary.
+
+### Can a hostile mod read the vault field or disable the gate directly?
+
+A reflective `getDeclaredField("accessToken")` read and a single-method gate retransformation are both removed:
+
+- The token is stored masked against a per-capture random pad in a single opaque record field. A name-based field read finds no `accessToken` field, and a blind scan for JWT-shaped static String fields finds no plaintext.
+- The former `authorized()` gate helper no longer exists. `forAuthentication()` performs its own inline call-context check, so an agent that retransforms a shared helper to return `true` has no target that opens the read path.
+
+An attacker who retransforms `forAuthentication()` itself, or who instruments the value at the moment it is decoded for an authentication call, is operating with Java-agent privilege; no Fabric mod can prevent code that is allowed to rewrite the defending code. Decoding the masked pair with reflection or `Unsafe` needs no agent but does require the attacker to adapt to the storage layout instead of reading a named plaintext field. The practical user-side countermeasure for the retransformation route is to start the JVM with `-XX:+DisableAttachMechanism` so dynamic self-attach is unavailable.
+
+### Does Fabric Loader expose the real token?
+
+The tested `FabricLoader.getLaunchArguments(false)` path returns the replacement.
+
+The tested `true` view omits the token option.
+
+Code that directly reads and stores Fabric's retained argument data before TokenProtector's `preLaunch` handler remains outside this protection.
+
+### What about launcher and operating-system process arguments?
+
+TokenProtector cannot rewrite the native operating-system command line or data stored by the launcher.
+
+It can inspect some sources and warn about possible exposure.
+
+These external copies are outside the in-JVM replacement boundary.
+
+### Does a normal `--accessToken` mean the launcher is malicious?
+
+No.
+
+A normal authenticated Minecraft launch supplies this argument.
+
+TokenProtector treats one standard launch token as expected exposure and warns about unexpected copies or unusual credential locations instead.
+
+### Can TokenProtector make the token impossible to steal?
+
+No.
+
+A Fabric mod cannot create a hard isolation boundary against arbitrary hostile code with equal or greater JVM or process privileges.
+
+TokenProtector instead removes the token from the practical surfaces that ordinary and advanced malicious mods commonly target, makes many targeted attacks return replacement data, and reports suspicious activity when it can identify it.
+
+### Does multiplayer still work?
+
+Yes.
+
+The tested client completes normal authenticated Minecraft operations while the covered public fields, getters, Fabric Loader arguments, authlib state, agent probes, and concurrent race probes continue to show replacement data or no observable auth header.
+
+### Does obfuscation defeat TokenProtector?
+
+Not by itself.
+
+Obfuscation can hide how an attacker locates a field or method. It does not change the replacement value stored in the protected field.
+
+## Assessment
+
+TokenProtector is a practical same-JVM hardening layer for Fabric clients.
+
+Its strongest property is that it replaces the data at multiple storage and handoff points instead of only trying to detect known stealer code.
+
+The adversarial TokenReader test is explicitly designed to defeat it. TokenReader uses more than 100 probe paths across direct APIs, raw fields, obfuscation, class discovery, authlib internals, high-priority Mixins, concurrent races, Fabric Loader state, deep HTTP hooks, OS and launcher probing, and a self-attached Byte Buddy Java agent.
+
+On the tested in-JVM paths, these probes receive replacement data or no observable authentication header.
+
+The Byte Buddy agent is a particularly strong test. It installs during Fabric `preLaunch`, instruments the final woven `Main.main` bytecode, and executes before every Mixin HEAD handler in that method. It still receives `FAKE_TOKEN_LOL` because TokenProtector removes the real token from Fabric's retained argument source before Fabric constructs the `Main.main` array.
+
+TokenReader also uses `Integer.MAX_VALUE` Mixins, direct and reflective field access, `Unsafe`, `privateLookupIn`, authlib object traversal, deep connection hooks, and high-speed races. The tested protected surfaces remain on replacement data while authentication continues to work.
+
+This does not make the JVM a sandbox. A more privileged attacker can still run before TokenProtector's pre-launch boundary, target TokenProtector's private retained state, use native code, or obtain an external token copy.
+
+Within its stated scope, TokenProtector makes token theft substantially harder and forces an attacker away from common and moderately advanced Fabric-stealer techniques toward narrower, more targeted, and more privileged attack paths.

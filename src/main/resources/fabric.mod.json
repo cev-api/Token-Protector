@@ -19,6 +19,9 @@
         "client": [
             "net.tokenprotector.TokenProtectorMod"
         ],
+        "preLaunch": [
+            "net.tokenprotector.PreLaunchProtector"
+        ],
         "modmenu": [
             "net.tokenprotector.config.ModMenuIntegration"
         ]

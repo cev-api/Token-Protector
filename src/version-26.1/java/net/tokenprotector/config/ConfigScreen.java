@@ -34,6 +34,8 @@ public class ConfigScreen extends Screen {
     private final Map<String, Boolean> expandedGroups = new HashMap<>();
     private final List<Object> pageWidgets = new ArrayList<>();
     private final List<Group> modGroups;
+    private final List<String> logRowCache = new ArrayList<>();
+    private int logCacheSize = -1;
 
     private Tab tab;
     private int listTop;
@@ -289,22 +291,69 @@ public class ConfigScreen extends Screen {
         int left = panelLeft();
         this.listTop = 66;
         this.listBottom = height - 36;
-        addPageLabel(left, 52, PANEL_W, "All TokenProtector alerts (newest first).");
+        addPageLabel(left, 52, PANEL_W, "Full TokenProtector log, newest first. Also written to tokenprotector.log.");
 
         List<SessionAccessMonitor.AlertLine> alerts = SessionAccessMonitor.recentAlertLines();
-        this.contentHeight = alerts.size() * ROW_H;
-        if (alerts.isEmpty()) {
-            addPageLabel(left + 8, listTop + 8, PANEL_W - 16, "No alerts recorded yet.");
+        if (logCacheSize != alerts.size()) {
+            logRowCache.clear();
+            for (SessionAccessMonitor.AlertLine alert : alerts) {
+                String prefix = TIME_FORMAT.format(alert.timestamp()) + " [" + alert.level() + "] ";
+                List<String> wrapped = wrapLog(prefix + alert.message(), PANEL_W - 28);
+                for (int w = 0; w < wrapped.size(); w++) {
+                    logRowCache.add(w == 0 ? wrapped.get(w) : "      " + wrapped.get(w));
+                }
+            }
+            logCacheSize = alerts.size();
+        }
+
+        this.contentHeight = logRowCache.size() * ROW_H;
+        if (logRowCache.isEmpty()) {
+            addPageLabel(left + 8, listTop + 8, PANEL_W - 16, "No log entries recorded yet.");
             return;
         }
 
-        int first = firstVisibleRow(alerts.size());
+        int first = firstVisibleRow(logRowCache.size());
         int visibleRows = visibleRowCount();
-        for (int i = 0; i < visibleRows && first + i < alerts.size(); i++) {
-            SessionAccessMonitor.AlertLine alert = alerts.get(first + i);
-            String text = TIME_FORMAT.format(alert.timestamp()) + "  " + alert.message();
-            addPageLabel(left + 8, listTop + i * ROW_H + 3, PANEL_W - 20, truncate(text, 94));
+        for (int i = 0; i < visibleRows && first + i < logRowCache.size(); i++) {
+            addPageLabel(left + 8, listTop + i * ROW_H + 3, PANEL_W - 20, logRowCache.get(first + i));
         }
+    }
+
+    /** Wraps one log line to the panel width, preserving newlines and hard-splitting overlong tokens. */
+    private List<String> wrapLog(String text, int maxWidth) {
+        List<String> out = new ArrayList<>();
+        for (String rawLine : text.split("\n", -1)) {
+            if (rawLine.isEmpty()) {
+                out.add("");
+                continue;
+            }
+            StringBuilder cur = new StringBuilder();
+            for (String word : rawLine.split(" ")) {
+                if (word.isEmpty()) continue;
+                String trial = cur.length() == 0 ? word : cur + " " + word;
+                if (cur.length() > 0 && font.width(trial) > maxWidth) {
+                    out.add(cur.toString());
+                    cur.setLength(0);
+                }
+                if (font.width(word) > maxWidth) {
+                    int start = 0;
+                    while (start < word.length()) {
+                        int end = start + 1;
+                        while (end <= word.length() && font.width(word.substring(start, end)) <= maxWidth) {
+                            end++;
+                        }
+                        String chunk = word.substring(start, Math.max(start + 1, end - 1));
+                        out.add(chunk);
+                        start += chunk.length();
+                    }
+                } else {
+                    if (cur.length() > 0) cur.append(' ');
+                    cur.append(word);
+                }
+            }
+            out.add(cur.toString());
+        }
+        return out;
     }
 
     @Override

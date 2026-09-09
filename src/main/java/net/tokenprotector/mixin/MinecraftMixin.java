@@ -11,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.ModifyArg;
  * Single-role: feeds the real token to authlib so multiplayer works.
  * Mod-facing protection is handled by UserMixin's caller-aware getters.
  */
-@Mixin(Minecraft.class)
+@Mixin(value = Minecraft.class, priority = 100000)
 public class MinecraftMixin {
 
     @ModifyArg(
