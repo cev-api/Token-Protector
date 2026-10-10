@@ -1,6 +1,7 @@
 {
     "required": true,
     "package": "net.tokenprotector.mixin",
+    "plugin": "net.tokenprotector.monitor.NativeMemoryMixinPlugin",
     "compatibilityLevel": "JAVA_${java_version}",
     "mixins": [],
     "client": [
@@ -9,6 +10,7 @@
         "MainMixin",
         "ScreenMixin",
         "UserMixin",
+        "TokenReaderMemoryScannerMixin",
         "YggdrasilAuthenticationServiceMixin"
     ],
     "injectors": {

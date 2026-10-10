@@ -8,6 +8,7 @@ import net.tokenprotector.monitor.SessionAccessMonitor;
 import net.tokenprotector.monitor.LaunchSecretScanner;
 import net.tokenprotector.monitor.MixinPostureProbe;
 import net.tokenprotector.monitor.InstrumentationPostureProbe;
+import net.tokenprotector.monitor.NativeMemoryReadMonitor;
 import net.tokenprotector.util.Log;
 import net.tokenprotector.util.MinecraftCompat;
 import org.slf4j.Logger;
@@ -26,6 +27,7 @@ public class TokenProtectorMod implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             AlertManager.flushIfNeeded();
+            NativeMemoryReadMonitor.flushAlerts();
             if (!osScanDone && MinecraftCompat.getToastManager(client) != null) {
                 osScanDone = true;
                 scanForOsLeaks();

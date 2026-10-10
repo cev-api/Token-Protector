@@ -179,6 +179,24 @@ public final class AlertManager {
         }
     }
 
+    /** Client-thread delivery of attributed native-scanner evidence, never a BLOCKED claim. */
+    public static boolean triggerMemoryReadAlert(String modName, String title, String summary, String details) {
+        Minecraft client = Minecraft.getInstance();
+        if (client == null || MinecraftCompat.getToastManager(client) == null) return false;
+        // These exposure alerts, like OS-leak alerts, are independent of getter whitelists.
+        SystemToast.add(MinecraftCompat.getToastManager(client),
+                SystemToast.SystemToastId.PERIODIC_NOTIFICATION,
+                Component.literal("§c⚠ " + title),
+                Component.literal("§6" + modName + " §7— " + summary));
+        if (client.player != null && Config.get().showChatMessages) {
+            try {
+                sendPlayerMessage(Component.literal("§c[TokenProtector] ⚠ " + title
+                        + " by §6" + modName + "§7. " + details));
+            } catch (ReflectiveOperationException ignored) {}
+        }
+        return true;
+    }
+
     // ── Toast ─────────────────────────────────────────────────────
 
     private static void showToast(Minecraft client, String modName, String field) {

@@ -105,43 +105,33 @@ public class UserMixin {
 
     @Inject(method = "getAccessToken", at = @At("RETURN"), cancellable = true)
     private void onGetAccessToken(CallbackInfoReturnable<String> cir) {
-        User self = (User) (Object) this;
-        String real = TokenAccess.forAuthentication();
-        if (real == null) real = this.accessToken;
-
         SessionAccessMonitor.AccessInfo info = SessionAccessMonitor.detectCaller();
         if (!Config.get().blockAccessToken || !shouldProtect(info, "accessToken")) {
-            cir.setReturnValue(real);
+            String real = TokenAccess.forAuthentication();
+            cir.setReturnValue(real != null ? real : this.accessToken);
             return;
         }
 
-        String replacement = tokenprotector$replacementAccessToken(real);
-        if (Objects.equals(real, replacement)) {
-            cir.setReturnValue(real);
-            return;
-        }
-
+        // Decide before decoding: hostile getter polling must not create real
+        // token Strings that an independent raw-memory scanner can collect.
+        String replacement = tokenprotector$replacementAccessToken(this.accessToken);
         cir.setReturnValue(replacement);
         blocked(info, "AccessToken");
     }
 
-    @Inject(method = "getSessionId", at = @At("RETURN"), cancellable = true)
+    @Inject(method = "getSessionId", at = @At("HEAD"), cancellable = true)
     private void onGetSessionId(CallbackInfoReturnable<String> cir) {
         SessionAccessMonitor.AccessInfo info = SessionAccessMonitor.detectCaller();
-        User self = (User) (Object) this;
-        TokenVault.SessionValues values = realValues(self);
-        String token = TokenAccess.forAuthentication();
-        if (token == null) token = this.accessToken;
-        String real = "token:" + token + ":" + values.profileId().toString().replace("-", "");
-
         if (!Config.get().blockSessionId || !shouldProtect(info, "sessionId")) {
-            cir.setReturnValue(real);
+            TokenVault.SessionValues values = realValues((User) (Object) this);
+            String token = TokenAccess.forAuthentication();
+            if (token == null) token = this.accessToken;
+            cir.setReturnValue("token:" + token + ":" + values.profileId().toString().replace("-", ""));
             return;
         }
 
-        String replacement = Config.get().getReplacement("sessionId", real, TokenFaker.fakeSessionId());
-        if (Objects.equals(real, replacement)) return;
-
+        // Credential replacement modes never need the original session ID.
+        String replacement = Config.get().getReplacement("sessionId", "", TokenFaker.fakeSessionId());
         cir.setReturnValue(replacement);
         blocked(info, "SessionId");
     }

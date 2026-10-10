@@ -59,6 +59,7 @@ public final class InstrumentationPostureProbe {
         scanAgentClasses("client");
         scanAgentJarArtifacts();
         verifyProtectedTargetIntegrity();
+        NativeMemoryReadMonitor.checkHookCoverage();
     }
 
     private static void scanPreLaunchEntrypoints() {

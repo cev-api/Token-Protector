@@ -1,10 +1,12 @@
 package net.tokenprotector.internal;
 
 import net.tokenprotector.monitor.SessionAccessMonitor;
+import net.tokenprotector.monitor.NativeMemoryReadMonitor;
 import org.spongepowered.asm.mixin.transformer.meta.MixinMerged;
 
 import java.lang.reflect.Method;
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -12,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Internal holder for the token used by TokenProtector's authentication
  * redirects. Public only because transformed callbacks live in Minecraft and
  * authlib classes; access is call-context gated and the value is stored masked,
- * never as plaintext.
+ * with fewer plaintext copies. Masking is not a process-memory boundary.
  */
 public final class TokenAccess {
     /** Our own package prefix; frames here are trusted as internal code. */
@@ -65,14 +67,15 @@ public final class TokenAccess {
         if (!gatePermits("captureFromUserConstructor")) return;
         if (token != null && !token.isBlank() && !issuedReplacements.contains(token)) {
             // Mask immediately; never leave the plaintext in a static field.
-            char[] chars = token.toCharArray();
-            char[] pad = new char[chars.length];
-            char[] masked = new char[chars.length];
-            for (int i = 0; i < chars.length; i++) {
+            // Read characters directly: toCharArray would leave an extra plaintext copy.
+            char[] pad = new char[token.length()];
+            char[] masked = new char[token.length()];
+            for (int i = 0; i < token.length(); i++) {
                 pad[i] = (char) RANDOM.nextInt(Character.MAX_VALUE + 1);
-                masked[i] = (char) (chars[i] ^ pad[i]);
+                masked[i] = (char) (token.charAt(i) ^ pad[i]);
             }
             authToken = new AuthToken(masked, pad);
+            NativeMemoryReadMonitor.captureFingerprint(token);
         }
     }
 
@@ -132,17 +135,23 @@ public final class TokenAccess {
 
         // Materialise the token only here, after the gate passed, so the only
         // reflectively reachable member that returns the secret is this gated
-        // method itself (the masked fields alone yield no usable value).
+        // method itself. An adaptive reader can still decode masked + pad.
         AuthToken secret = authToken;
         if (secret == null) return null;
         char[] masked = secret.masked();
         char[] pad = secret.pad();
         if (masked == null || pad == null || masked.length != pad.length) return null;
         char[] out = new char[masked.length];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = (char) (masked[i] ^ pad[i]);
+        try {
+            for (int i = 0; i < out.length; i++) {
+                out[i] = (char) (masked[i] ^ pad[i]);
+            }
+            return new String(out);
+        } finally {
+            // Best effort only: the returned String and JVM/native copies cannot
+            // be erased here, and a concurrent native reader can observe out.
+            Arrays.fill(out, '\0');
         }
-        return new String(out);
     }
 
     /**

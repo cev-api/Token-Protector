@@ -34,9 +34,12 @@ TokenProtector assumes that another Fabric mod can use normal and advanced same-
 - concurrent polling,
 - Fabric `preLaunch` entrypoints,
 - dynamic Java-agent self-attach,
-- bytecode instrumentation.
+- bytecode instrumentation,
+- native process-memory reading and scanning.
 
 TokenProtector also treats launcher, operating-system, native, and filesystem credential copies as a separate trust boundary.
+
+Native memory recovery is treated as detectable-but-not-blockable: the token must exist in the process, so the mod's goal there is to confirm and attribute the read, not to prevent it.
 
 The security goal is:
 
@@ -45,6 +48,75 @@ The security goal is:
 3. Give the real token only to the authentication path that requires it.
 4. Report blocked or suspicious activity when attribution is possible.
 5. State the remaining same-JVM and external limits clearly.
+
+## Memory reads
+
+The real token must exist in the Minecraft process memory for the client to authenticate. Any mod that shares the process can copy that memory with native code, and a Fabric mod cannot prevent, block, or intercept an arbitrary native read. TokenProtector does not claim to stop memory recovery. It detects and attributes recovery on the scanner paths it supports, and reports it.
+
+### Token fingerprint
+
+Detection never needs a second plaintext copy of the token. When `TokenAccess` captures the real credential, `NativeMemoryReadMonitor.captureFingerprint(...)` stores only:
+
+- a SHA-256 digest of the token bytes,
+- a short prefix of the token, used to reject most candidate offsets cheaply,
+- the token length,
+- a generation counter that increments on each new capture.
+
+Only `TokenAccess` may establish a fingerprint. The method is call-context checked: it returns immediately unless the immediate caller class is `TokenAccess` itself, so another mod cannot seed the detector with a token of its choosing, clear a real fingerprint, or fabricate evidence. A new capture (for example after an account switch) replaces the fingerprint and increments the generation, so a detection from an earlier account is not reported against the current one, while a value TokenProtector itself issued as a replacement can never overwrite the real fingerprint.
+
+The fingerprint is retained in preference to the token; the plaintext is not stored for detection and is never written to the log or the chat alert.
+
+### Scanner hook and matching
+
+The detector attaches an optional Mixin to the tested native scanner entry point. The hook is `@Pseudo` with `require = 0`, so it compiles and loads whether or not the reader is installed and cannot break startup when it is absent.
+
+When the scanner reaches that entry point, the hook receives the bytes the scanner just copied out of process memory, the valid length, and the window address. Matching runs on those bytes without modifying them:
+
+- plain 8-bit layouts are matched at any offset, including windows where the token is not at position zero;
+- UTF-16LE layouts are matched as well, because native and JVM buffers often retain ASCII credentials in that form;
+- the full SHA-256 digest must match, so a partial, truncated, or partially overwritten window does not produce a false positive.
+
+A match proves that the observed window contains the captured token. It does not prove live validity, that the value was exfiltrated, or which process the bytes came from. The scanner's own body is untouched: the original callback still runs exactly once.
+
+Attribution is verified rather than assumed. `NativeMemoryReadMonitor.observeWindow(...)` walks the stack, requires that the immediate caller class is the declared reader class, and requires that the calling method carries `@MixinMerged` metadata naming TokenProtector's own hook mixin. A call from any other caller is ignored, including a mod that mimics the reader class name, so an attacker cannot fabricate attributed read evidence. Unrelated callers produce no detection and no log line.
+
+### Coverage verification
+
+Merging a handler is not the same as the handler being called. A Mixin config plugin (`NativeMemoryMixinPlugin`) inspects the transformed scanner class and records whether the class actually contains a call to TokenProtector's merged handler for the expected entry point. If the reader is installed but its callback was not inserted (an incompatible reader version), TokenProtector raises `Memory Read Detector Unavailable` instead of appearing to have coverage it does not have. If the reader is absent, the hook is silently inert.
+
+### Alerting
+
+Scanner threads never touch Minecraft UI or game state. A confirmed or observed read is queued and flushed on the client thread, which:
+
+- records a `MemoryTokenRecovery` or `NativeMemoryScan` entry in Recent Detections,
+- writes an ALERT line to the console and to `tokenprotector.log`,
+- shows a toast and, when chat messages are enabled, a chat line naming the reading mod.
+
+These are exposure alerts, like OS-leak alerts, and are not affected by the getter allow-list: allowing a mod's caller-aware getter access does not suppress memory-read evidence. A confirmed recovery is reported once per reader per capture generation, and a scan notice does not suppress a later recovery report.
+
+### Reduced plaintext copies
+
+Between hookable reads, TokenProtector also shrinks the amount of plaintext a scanner can harvest:
+
+- the masking path reads characters directly instead of first creating a `char[]` copy of the token;
+- blocked getter paths choose their replacement before any plaintext is decoded, so hostile getter polling does not materialise real token Strings for an independent scanner to collect;
+- the decode buffer is zeroed in a `finally` block once the plaintext has been materialised.
+
+This is best effort. The returned `String`, interning and other JVM copies, and native copies cannot be erased from inside the JVM, and a concurrent reader can still observe the buffer before it is zeroed. Masking and these hygiene steps defeat blind scans and shrink the exposure window; they are not a process-memory boundary.
+
+### Tested evidence
+
+The hook is covered by unit tests and a forked Mixin integration harness that transforms a scanner fixture without starting Minecraft:
+
+| Scenario | Result |
+|---|---|
+| Read window containing the token (ASCII, UTF-16LE, non-zero offset) | Recovery confirmed; window left unmodified |
+| Read window with a decoy, a truncated token, or a changed byte | No recovery reported |
+| Unrelated or spoofed caller class | No detection, no attribution, no log line |
+| Reader absent | Hook inert, startup unaffected, no fabricated evidence |
+| Reader present but hook not inserted | Coverage reported as unavailable, not as active |
+| Reader present, hook inserted via real transformation | Recovery and scan recorded; reader's original callback still runs |
+| Account switch to a new capture | Same reader reports recovery again for the new generation |
 
 ## Protection architecture
 
@@ -187,7 +259,7 @@ A blocked event can include:
 
 Caller attribution is best effort.
 
-A direct field read or low-level memory read can avoid a getter hook. TokenProtector therefore treats replacement of the underlying data and attribution of a read as separate protections.
+A direct field read or low-level memory read can avoid a getter hook. TokenProtector therefore treats replacement of the underlying data and attribution of a read as separate protections; memory reads on supported scanner paths are detected and attributed separately (see [Memory reads](#memory-reads)).
 
 ### Internal authentication helper
 
@@ -363,6 +435,7 @@ The adversarial run reports replacement data across the tested in-JVM token surf
 | Runtime account-switch `User` construction | `FAKE_TOKEN_LOL` |
 | Reflective read of vault field `accessToken` | Field does not exist (credential masked at rest) |
 | Blind scan of static String fields for a JWT | No real token found |
+| Supported native scanner read window containing the captured token | Recovery confirmed and attributed to the reader; read observed, not blocked |
 | Agent retransformation of a shared gate helper | No shared `authorized()` helper exists; the read gate is inline in the accessor |
 | Reflective `forAuthentication()` after gate-kill attempt | `null` (still denied) |
 
@@ -544,6 +617,8 @@ The stored credential is masked at rest and the read gate is duplicated, so a na
 
 TokenProtector can detect some of these conditions, but detection does not equal isolation.
 
+Native memory recovery is a related but distinct case. Reading the token out of process memory cannot be prevented from inside the JVM, so the mod's response is detection and attribution on supported scanner hooks rather than blocking. That evidence names the reading mod and confirms the token was recovered, but it does not stop the read, does not prove exfiltration, and does not cover readers that bypass the hook.
+
 A stronger architecture can keep the real credential outside the Minecraft JVM entirely, for example by using a launcher-side authentication broker. TokenProtector does not require a custom launcher and does not provide that architecture.
 
 ## Optional JVM hardening
@@ -623,6 +698,14 @@ A reflective `getDeclaredField("accessToken")` read and a single-method gate ret
 
 An attacker who retransforms `forAuthentication()` itself, or who instruments the value at the moment it is decoded for an authentication call, is operating with Java-agent privilege; no Fabric mod can prevent code that is allowed to rewrite the defending code. Decoding the masked pair with reflection or `Unsafe` needs no agent but does require the attacker to adapt to the storage layout instead of reading a named plaintext field. The practical user-side countermeasure for the retransformation route is to start the JVM with `-XX:+DisableAttachMechanism` so dynamic self-attach is unavailable.
 
+### Can another mod read the token straight out of process memory?
+
+Yes, and TokenProtector cannot stop that. The token has to exist in the process for authentication, so a mod using native reads can recover it, and a Fabric mod cannot block or intercept an arbitrary native read.
+
+What TokenProtector does is turn the supported case into attributed evidence. It keeps a SHA-256 fingerprint of the captured token, inspects the read window of a scanner on the hook path, and when the window contains the token raises a `SESSION TOKEN RECOVERED FROM MEMORY` alert naming the reading mod, the reader class, and the scan address, while the read itself still succeeds. A scan window without the token raises a lower-severity notice, and a known reader whose hook could not be installed is reported as uncovered rather than silently assumed covered.
+
+This is detection and attribution only. It is limited to the scanner hooks TokenProtector supports, a match confirms recovery rather than exfiltration or live validity, and a reader that uses a different entry point or scans at a different privilege is not observed.
+
 ### Does Fabric Loader expose the real token?
 
 The tested `FabricLoader.getLaunchArguments(false)` path returns the replacement.
@@ -681,6 +764,6 @@ The Byte Buddy agent is a particularly strong test. It installs during Fabric `p
 
 TokenReader also uses `Integer.MAX_VALUE` Mixins, direct and reflective field access, `Unsafe`, `privateLookupIn`, authlib object traversal, deep connection hooks, and high-speed races. The tested protected surfaces remain on replacement data while authentication continues to work.
 
-This does not make the JVM a sandbox. A more privileged attacker can still run before TokenProtector's pre-launch boundary, target TokenProtector's private retained state, use native code, or obtain an external token copy.
+This does not make the JVM a sandbox. A more privileged attacker can still run before TokenProtector's pre-launch boundary, target TokenProtector's private retained state, use native code, or obtain an external token copy. Native memory recovery is one step harder to hide but no easier to block: on supported scanner hooks the recovery is confirmed and attributed to the reading mod, and the read still proceeds.
 
 Within its stated scope, TokenProtector makes token theft substantially harder and forces an attacker away from common and moderately advanced Fabric-stealer techniques toward narrower, more targeted, and more privileged attack paths.

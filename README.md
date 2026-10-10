@@ -30,15 +30,16 @@ TokenProtector protects these tested in-JVM paths:
 | Tested `HttpURLConnection` auth-header probes | No `Authorization` value observed |
 | Reflective read of the internal vault field (`getDeclaredField("accessToken")`) | No such field exists (credential is masked at rest) |
 | Blind scan of static String fields for a JWT | No real token found |
+| Native memory reads through a supported scanner hook | Token recovery confirmed and attributed to the reading mod; alerted, not blocked |
 | Retransformation targeting a single shared gate helper (`authorized()`) | No such helper exists (read gate is inline and duplicated) |
 
 TokenProtector sanitizes Fabric's retained launch arguments during Fabric `preLaunch`. Fabric builds the later `Main.main(String[])` array from this retained data. As a result, the game receives the replacement token before normal Minecraft startup code runs.
 
-TokenProtector also defends the internal state that holds the real token for authentication. The credential is never kept as a plaintext String: it is masked against a per-capture random pad and the plaintext is materialised only inside the gated read path at the moment it is handed to an authentication call. The read gate is performed inline in the accessor rather than delegated to a single helper method, so there is no `authorized()`-style choke point that a hostile retransformation could force to always allow.
+TokenProtector also hardens the internal state that holds the real token for authentication. The retained vault value is masked against a per-capture random pad. Authorized getter and authentication reads still create plaintext Strings, while blocked getters choose replacements before decoding. The read gate is performed inline in the accessor rather than delegated to a single helper method, so there is no `authorized()`-style choke point that a hostile retransformation could force to always allow. Neither masking nor this gate provides process-memory isolation.
 
 ## Adversarial testing
 
-TokenProtector is tested against TokenReader, a separate adversarial Fabric test mod (100+ probes across 13 categories). Every probe receives replacement data or nothing, and Minecraft authentication still completes:
+TokenProtector is tested against TokenReader, a separate adversarial Fabric test mod (100+ probes across 13 categories). The tested Java-level reads receive replacement data or nothing while Minecraft authentication continues to work:
 
 - normal, reflective, obfuscated, and low-level reads of protected fields and getters → `FAKE_TOKEN_LOL`
 - maximum-priority (`Integer.MAX_VALUE`) Mixins on `Main.main` and `User` construction → `FAKE_TOKEN_LOL`
@@ -49,7 +50,23 @@ TokenProtector is tested against TokenReader, a separate adversarial Fabric test
 - anti-protector vault read (`getDeclaredField("accessToken")`) → no such field (masked at rest)
 - anti-protector agent gate-kill retransformation → no `authorized()` helper to neutralise; reflective `forAuthentication()` still returns `null`
 
+The native memory scanner path is treated differently, because it cannot be blocked: the read succeeds, and TokenProtector confirms and attributes the recovery. See [Memory reads](#memory-reads).
+
 Full details and technical limits are in [WRITEUP.md](WRITEUP.md).
+
+### Memory reads
+
+The real token has to exist in the Minecraft process memory for the client to authenticate, and another mod that shares that process can copy it out with native code. No Fabric mod can block that read, and TokenProtector does not claim to. What it does provide is detection and attribution on the scanner paths it knows about:
+
+- at capture time TokenProtector stores a SHA-256 fingerprint of the real token (digest, short prefix, and length) instead of the token itself, so detection does not add another full plaintext copy to memory
+- when a supported native scanner copies a memory region, TokenProtector inspects the bytes it just read, matching plain 8-bit and UTF-16LE layouts at any offset
+- a match proves the scanner's buffer contains the current session token; TokenProtector raises a `SESSION TOKEN RECOVERED FROM MEMORY` alert naming the reading mod (mod name, mod ID, reader class, and scan address) and records it in Recent Detections and `tokenprotector.log`, without logging the token
+- a scan window that does not contain the token still raises a lower-severity `NATIVE MEMORY SCAN OBSERVED` notice
+- if a known reader is installed but its hook could not be inserted, TokenProtector reports `Memory Read Detector Unavailable` rather than appearing to be covered
+
+Detection is limited to the scanner hooks TokenProtector supports (the path used by the adversarial TokenReader test mod). It is not a universal native-read interceptor, so another scanner, arbitrary native reads, or a reader using a different entry point are not observed. A match also confirms recovery, not live validity, exfiltration, or which process the bytes came from.
+
+Between hookable reads, TokenProtector also shrinks the amount of plaintext available to a scanner: blocked getter paths choose their replacement before any plaintext is decoded, the masking path avoids an extra `char[]` copy of the token, and the decode buffer is zeroed after the plaintext is materialised. That is best-effort hygiene, not a process-memory boundary.
 
 ## Limits
 
@@ -59,9 +76,9 @@ TokenProtector is a hardening mod, not a sandbox. Its limitations:
 - the retained credential is masked at rest, but an adaptive reflective/`Unsafe` attacker can still decode the mask
 - code that runs outside TokenProtector's own hooks is out of reach: a launcher-supplied `-javaagent`, a modified loader/JVM, an earlier `preLaunch` that copies the retained arguments, and agent retransformation of TokenProtector's own methods
 - native code, OS/launcher/file copies of the token, and network interception outside the tested Java paths cannot be stopped in-JVM
-- direct memory reads and some low-level access paths bypass caller-aware hooks, so not every read is attributable
+- direct memory reads and some low-level access paths bypass caller-aware hooks, so not every read is attributable, and a read that is detected is reported, not stopped
 
-While these are the limitations, most are still detected by the mod, just not blocked. This is because blocking them is outside what a same-JVM Fabric mod can enforce. Competing high-priority Mixins, `preLaunch` entrypoints, agent tooling, dynamic-attach artifacts, stripped protected classes, spin-races, and unexpected credential copies in environment variables, system properties, or process arguments all raise alerts. Only events that give no in-JVM signal at all, such as a launcher agent that runs before Fabric, native code, file copies, and network interception cannot be surfaced, and those are the true silent limits.
+Competing Mixins, early entrypoints, agent tooling, spin-races, and unexpected credential copies raise alerts. Native token recovery is detectable and attributable only through supported scanner hooks, where it is confirmed but not blocked; unobserved native and external reads can remain silent.
 
 Full technical detail is in [WRITEUP.md](WRITEUP.md).
 
@@ -72,6 +89,7 @@ TokenProtector reports blocked caller-aware access (mod, class, method, line, fi
 - blocked reads return replacement data and raise an alert with caller details
 - high-speed polling / spin-race detection alerts even for whitelisted mods
 - OS-level leaks (environment variables, system properties, process arguments) are detected and reported, not blocked
+- native memory scans on supported scanner hooks are detected and attributed to the reading mod, reported as confirmed token recovery when the token is present in the read window
 - posture findings (competing high-priority Mixins, preLaunch entrypoints, agent tooling, dynamic-attach artifacts, stripped protected classes) are surfaced as alerts
 
 A warning means a possible credential is present in an inspected source; it does not prove another mod reads it. A single normal `--accessToken` launch argument is treated as expected exposure; warnings are for unexpected copies (duplicate tokens, `--msaToken`/`--refreshToken`, unknown JWT-shaped or wrapper-embedded values, long credential-like values, env/system-property leaks).

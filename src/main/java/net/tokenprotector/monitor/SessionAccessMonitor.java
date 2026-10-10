@@ -135,6 +135,17 @@ public final class SessionAccessMonitor {
         );
     }
 
+    /** Attributed scanner evidence; unlike getter reports this is not a blocked read. */
+    public static void recordMemoryRead(AccessInfo info, boolean recovered, String details) {
+        synchronized (RECENT_DETECTIONS) {
+            RECENT_DETECTIONS.addFirst(new Detection(Instant.now(),
+                    recovered ? "MemoryTokenRecovery" : "NativeMemoryScan", info, details));
+            while (RECENT_DETECTIONS.size() > MAX_RECENT_DETECTIONS) {
+                RECENT_DETECTIONS.removeLast();
+            }
+        }
+    }
+
     public static void recordLine(String level, String line) {
         synchronized (RECENT_ALERTS) {
             RECENT_ALERTS.addFirst(new AlertLine(Instant.now(), level, line));

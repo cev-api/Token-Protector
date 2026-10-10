@@ -73,6 +73,10 @@ if (singleBuild) {
     dependencies {
         minecraft "com.mojang:minecraft:${project.minecraft_version}"
 
+        testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+        testImplementation 'org.mockito:mockito-core:5.22.0'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
         if (mappingsMode == 'official') {
             mappings loom.officialMojangMappings()
         } else if (project.hasProperty('mappings_version')) {
@@ -112,6 +116,11 @@ if (singleBuild) {
                 }
             }
         }
+    }
+
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        systemProperty 'memoryReadTestClasspath', sourceSets.test.runtimeClasspath.asPath
     }
 
     def javaRelease = project.java_version as int
